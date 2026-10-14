@@ -30,6 +30,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <math.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -502,12 +503,27 @@ struct zt_server {
 	char media_title[100], media_artist[80];
 	struct zt_layer volume_layer;
 	struct wl_event_source *volume_timer;
+	/* Lumia Metro top modal dialog */
+	bool dialog_open;
+	float dialog_y;			/* 0 shown, -dialog_h out of sight */
+	double dialog_h;
+	char dialog_title[96];
+	char dialog_text[256];
+	char dialog_btn1[64];
+	char dialog_act1[64];
+	char dialog_btn2[64];
+	char dialog_act2[64];
+	double dialog_btn_y, dialog_btn_h;
+	bool dialog_stacked;
+	struct zt_layer dialog_layer;
 	/* colour temperature: every pixel multiplied by this */
 	int tone_k;			/* Kelvin; 6500 is no change */
 	GLuint tone_tex;
 	bool tone_dirty;
 	struct wlr_idle_notifier_v1 *idle_notifier;	/* for hypridle and the like */
 	uint32_t wifi_read_ms;
+	bool wifi_suspend;
+	bool wifi_suspended_by_sleep;
 	float lock_y;			/* 0 covering the screen, -height pushed off the top */
 	bool keypop;			/* the pressed key shown enlarged above the finger */
 	float keypop_x, keypop_y;
@@ -1812,6 +1828,52 @@ static void config_keep(const char *key, int value) {
 	rename(tmp, path);
 }
 
+/* Set panel brightness via Linux backlight sysfs interface (0..100%).
+ * On Galaxy S9, /sys/class/backlight/s9p-panel has max_brightness=572 (AOR register). */
+static void backlight_set(int percent) {
+	static int last_raw = -1;
+	static int max_b = -1;
+	static char dev_path[128] = "";
+
+	if (!dev_path[0]) {
+		glob_t g;
+		if (glob("/sys/class/backlight/*/brightness", 0, NULL, &g) == 0 && g.gl_pathc > 0) {
+			snprintf(dev_path, sizeof(dev_path), "%s", g.gl_pathv[0]);
+			char max_path[140];
+			char *slash = strrchr(dev_path, '/');
+			if (slash) {
+				snprintf(max_path, sizeof(max_path), "%.*s/max_brightness", (int)(slash - dev_path), dev_path);
+				FILE *mf = fopen(max_path, "r");
+				if (mf) {
+					if (fscanf(mf, "%d", &max_b) != 1) max_b = -1;
+					fclose(mf);
+				}
+			}
+		}
+		globfree(&g);
+		if (!dev_path[0]) {
+			snprintf(dev_path, sizeof(dev_path), "none");
+		}
+	}
+	if (strcmp(dev_path, "none") == 0) return;
+
+	if (percent < 1) percent = 1;
+	if (percent > 100) percent = 100;
+
+	int raw = (max_b > 0) ? (int)lround((double)percent * max_b / 100.0) : percent;
+	if (raw < 1) raw = 1;
+	if (max_b > 0 && raw > max_b) raw = max_b;
+
+	if (raw == last_raw) return;
+	last_raw = raw;
+
+	FILE *f = fopen(dev_path, "w");
+	if (f) {
+		fprintf(f, "%d\n", raw);
+		fclose(f);
+	}
+}
+
 static void load_config(struct zt_server *server) {
 	char path[512];
 	const char *home = getenv("HOME");
@@ -1886,9 +1948,12 @@ static void load_config(struct zt_server *server) {
 			server->show_touches = strcmp(value, "on") == 0;
 		} else if (strcmp(key, "lock") == 0) {
 			server->lock_enabled = strcmp(value, "off") != 0;
+		} else if (strcmp(key, "wifi_suspend") == 0) {
+			server->wifi_suspend = strcmp(value, "on") == 0 || strcmp(value, "1") == 0;
 		}
 	}
 	fclose(f);
+	backlight_set(server->shade_brightness);
 }
 
 static void add_tile(struct zt_server *server, enum tile_size size, const char *color,
@@ -2739,6 +2804,7 @@ static double text_width(const char *text, const char *font, double size);
  * the clock. Nothing here waits on a program. */
 static void modem_read(struct zt_server *server) {
 	FILE *f = fopen("/run/ztoscorenetworking/status", "r");
+	if (!f) f = fopen("/run/zrn-modem/status", "r");
 	server->cell_known = f != NULL;
 	server->cell_bars = 0;
 	server->cell_sim[0] = server->cell_operator[0] = server->cell_tech[0] = server->cell_reg[0] = 0;
@@ -4430,6 +4496,7 @@ static void shade_activate(struct zt_server *server, int index) {
 			server->shade_brightness = 25;
 		}
 		config_keep("brightness", server->shade_brightness);	/* remembered */
+		backlight_set(server->shade_brightness);
 		draw_shade(server);
 		damage(server);
 		break;
@@ -5310,15 +5377,19 @@ static int long_press_fired(void *data) {
 	return 0;
 }
 
-/* Tell zrnperfd, if it is running, that the screen went off or on. */
-static void perf_tell(const char *command) {
-	int fd = open("/run/zrnperfd.ctl", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+static void pipe_tell(const char *path, const char *command) {
+	int fd = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 	if (fd >= 0) {
 		if (write(fd, command, strlen(command)) < 0) {
-			wlr_log(WLR_DEBUG, "zrnperfd did not take '%s'", command);
+			wlr_log(WLR_DEBUG, "pipe '%s' did not take '%s'", path, command);
 		}
 		close(fd);
 	}
+}
+
+/* Tell zrnperfd, if it is running, that the screen went off or on. */
+static void perf_tell(const char *command) {
+	pipe_tell("/run/zrnperfd.ctl", command);
 }
 
 /* The volume keys: a banner drops from the top with the level, as a count
@@ -5426,6 +5497,173 @@ static void note_add(struct zt_server *server, const char *app, const char *titl
 	damage(server);
 }
 
+/* Lumia Metro top modal dialog: slides down from the top with title, message,
+/* ztOS Python SDK Dialog style: panel background #1f1f1f, margins (24, 40, 24, 20),
+ * title FONT_SEMIBOLD 20pt, body FONT_REGULAR 15pt, buttons with 2px solid white border,
+ * transparent background, height 40px in a row with 12px spacing. */
+static void draw_dialog(struct zt_server *server) {
+	if (server->width <= 0) return;
+
+	double w = server->width;
+	double pad = 24.0;
+	double content_w = w - 2 * pad;
+
+	/* Measure text height */
+	cairo_surface_t *dummy_surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+	cairo_t *dummy_cr = cairo_create(dummy_surf);
+	PangoLayout *layout = pango_cairo_create_layout(dummy_cr);
+	PangoFontDescription *desc = pango_font_description_from_string(FONT_REGULAR);
+	pango_font_description_set_absolute_size(desc, 15.0 * PANGO_SCALE);
+	pango_layout_set_font_description(layout, desc);
+	pango_layout_set_width(layout, (int)(content_w * PANGO_SCALE));
+	pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+	pango_layout_set_text(layout, server->dialog_text, -1);
+	int tw, th;
+	pango_layout_get_pixel_size(layout, &tw, &th);
+	pango_font_description_free(desc);
+	g_object_unref(layout);
+	cairo_destroy(dummy_cr);
+	cairo_surface_destroy(dummy_surf);
+
+	double title_y = 40.0;
+	double title_h = 28.0;
+	double text_y = title_y + title_h + 12.0;
+	double btn_h = 40.0;
+	double btn_y = text_y + th + 20.0;
+
+	bool stack_buttons = false;
+	if (server->dialog_btn2[0]) {
+		double btn_gap = 12.0;
+		double half_w = (content_w - btn_gap) / 2.0;
+		double tw1 = text_width(server->dialog_btn1, FONT_REGULAR, 15.0);
+		double tw2 = text_width(server->dialog_btn2, FONT_REGULAR, 15.0);
+		if (tw1 + 24.0 > half_w || tw2 + 24.0 > half_w) {
+			stack_buttons = true;
+		}
+	}
+	server->dialog_stacked = stack_buttons;
+
+	double total_h = stack_buttons ? (btn_y + 2 * btn_h + 12.0 + 20.0) : (btn_y + btn_h + 20.0);
+
+	server->dialog_h = total_h;
+	server->dialog_btn_y = btn_y;
+	server->dialog_btn_h = btn_h;
+
+	/* Render dialog */
+	cairo_t *cr;
+	struct zt_buffer *buffer = zt_buffer_create(server, (int)w, (int)total_h, &cr);
+
+	/* Background: ztOS Python SDK panel style: #1f1f1f */
+	cairo_set_source_rgb(cr, 31.0 / 255.0, 31.0 / 255.0, 31.0 / 255.0);
+	cairo_rectangle(cr, 0, 0, w, total_h);
+	cairo_fill(cr);
+
+	/* Heading: FONT_SEMIBOLD, 20pt, pure white */
+	cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+	draw_text(cr, server->dialog_title, FONT_SEMIBOLD, 20.0, pad, title_y, content_w, 0, false);
+
+	/* Body text: FONT_REGULAR, 15pt, pure white */
+	cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+	layout = pango_cairo_create_layout(cr);
+	desc = pango_font_description_from_string(FONT_REGULAR);
+	pango_font_description_set_absolute_size(desc, 15.0 * PANGO_SCALE);
+	pango_layout_set_font_description(layout, desc);
+	pango_layout_set_width(layout, (int)(content_w * PANGO_SCALE));
+	pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+	pango_layout_set_text(layout, server->dialog_text, -1);
+	cairo_move_to(cr, pad, text_y);
+	pango_cairo_show_layout(cr, layout);
+	pango_font_description_free(desc);
+	g_object_unref(layout);
+
+	/* Buttons: QPushButton style: 2px solid white border, transparent background, white text */
+	cairo_set_line_width(cr, 2.0);
+	if (server->dialog_btn2[0]) {
+		if (stack_buttons) {
+			/* Button 1 */
+			cairo_rectangle(cr, pad, btn_y, content_w, btn_h);
+			cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+			cairo_stroke(cr);
+			draw_text(cr, server->dialog_btn1, FONT_REGULAR, 15.0, pad, btn_y, content_w, btn_h, true);
+
+			/* Button 2 */
+			cairo_rectangle(cr, pad, btn_y + btn_h + 12.0, content_w, btn_h);
+			cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+			cairo_stroke(cr);
+			draw_text(cr, server->dialog_btn2, FONT_REGULAR, 15.0, pad, btn_y + btn_h + 12.0, content_w, btn_h, true);
+		} else {
+			double btn_gap = 12.0;
+			double btn_w = (content_w - btn_gap) / 2.0;
+
+			/* Button 1 */
+			cairo_rectangle(cr, pad, btn_y, btn_w, btn_h);
+			cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+			cairo_stroke(cr);
+			draw_text(cr, server->dialog_btn1, FONT_REGULAR, 15.0, pad, btn_y, btn_w, btn_h, true);
+
+			/* Button 2 */
+			cairo_rectangle(cr, pad + btn_w + btn_gap, btn_y, btn_w, btn_h);
+			cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+			cairo_stroke(cr);
+			draw_text(cr, server->dialog_btn2, FONT_REGULAR, 15.0, pad + btn_w + btn_gap, btn_y, btn_w, btn_h, true);
+		}
+	} else {
+		/* Single Button */
+		cairo_rectangle(cr, pad, btn_y, content_w, btn_h);
+		cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+		cairo_stroke(cr);
+		draw_text(cr, server->dialog_btn1, FONT_REGULAR, 15.0, pad, btn_y, content_w, btn_h, true);
+	}
+
+	zt_buffer_show(server, &server->dialog_layer, buffer, cr, (int)w, (int)total_h);
+}
+
+static void dialog_close(struct zt_server *server) {
+	if (!server->dialog_open) return;
+	animate(server, &server->dialog_y, (float)-server->dialog_h, 170, 0, false);
+	server->dialog_open = false;
+	damage(server);
+}
+
+static void dialog_handle_action(struct zt_server *server, const char *act) {
+	if (!act || !act[0]) return;
+	wlr_log(WLR_INFO, "dialog: executing action '%s'", act);
+	if (strcmp(act, "reboot_recovery") == 0) {
+		pipe_tell("/run/ztoscsf.ctl", "reboot_recovery\n");
+		run_detached("reboot", "recovery", NULL, NULL);
+		run_detached("systemctl", "reboot", NULL, NULL);
+		run_detached("/bin/sh", "-c", "echo 0_v1ru51234 | sudo -S reboot recovery 2>/dev/null", NULL);
+	} else if (strcmp(act, "stop_sensorhub") == 0) {
+		pipe_tell("/run/ztoscsf.ctl", "stop_sensorhub\n");
+		run_detached("/bin/sh", "-c",
+			"touch /run/ztoscsf-sensorhub.stopped /run/sensorhub.stopped; "
+			"echo 0_v1ru51234 | sudo -S systemctl stop zrn-sensorhub.service ztoscsf-sensorhub.service zrnsensord.service ztoscsf-sensord.service 2>/dev/null",
+			NULL);
+		note_add(server, "ztOSCoreSensorFramework", "Sensor Hub Stopped", "Sensor hub has been stopped for this boot.");
+	} else if (act[0] == '/' || strchr(act, ' ')) {
+		run_detached("/bin/sh", "-c", act, NULL);
+	}
+}
+
+static void dialog_show(struct zt_server *server, const char *title, const char *text,
+		const char *btn1, const char *act1, const char *btn2, const char *act2) {
+	snprintf(server->dialog_title, sizeof(server->dialog_title), "%s", title ? title : "Dialog");
+	snprintf(server->dialog_text, sizeof(server->dialog_text), "%s", text ? text : "");
+	snprintf(server->dialog_btn1, sizeof(server->dialog_btn1), "%s", btn1 ? btn1 : "ok");
+	snprintf(server->dialog_act1, sizeof(server->dialog_act1), "%s", act1 ? act1 : "dismiss");
+	snprintf(server->dialog_btn2, sizeof(server->dialog_btn2), "%s", btn2 ? btn2 : "");
+	snprintf(server->dialog_act2, sizeof(server->dialog_act2), "%s", act2 ? act2 : "");
+
+	if (server->width == 0) return;
+
+	draw_dialog(server);
+	server->dialog_open = true;
+	server->dialog_y = (float)-server->dialog_h;
+	animate(server, &server->dialog_y, 0.0f, 260, 0, false);
+	hap(server, HAP_TAP, HG_SYSTEM);
+	damage(server);
+}
+
 /* Uninstall an SDK app from the app list: it is closed, its tile goes, and
  * its files (the binary, its entry, icon, saved data and log), all in the
  * user's home, are removed. ztapps sees the entry go and the list follows. */
@@ -5520,8 +5758,19 @@ static void screen_set(struct zt_server *server, bool on) {
 	wlr_log(WLR_INFO, "screen %s", on ? "on" : "off");
 	if (!on) {
 		perf_tell("screen off\n");
+		if (server->wifi_suspend && wifi_up()) {
+			server->wifi_suspended_by_sleep = true;
+			run_detached("nmcli", "radio", "wifi", "off");
+			server->wifi_bars = -1;
+			server->wifi_read_ms = now_ms();
+		}
 	}
 	if (on) {
+		if (server->wifi_suspended_by_sleep) {
+			server->wifi_suspended_by_sleep = false;
+			run_detached("nmcli", "radio", "wifi", "on");
+			server->wifi_read_ms = 0;
+		}
 		server->idle_armed_ms = 0;
 		wl_event_source_timer_update(server->net_timer, 1000);
 		draw_status(server);	/* the clock moved on while it slept */
@@ -5567,6 +5816,66 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 	p->scroll0 = server->scroll;
 	if (server->show_touches) {
 		damage(server);
+	}
+	if (server->dialog_open && server->dialog_y > (float)-server->dialog_h + 10.0f) {
+		if (y >= server->dialog_y && y <= server->dialog_y + server->dialog_h) {
+			double dy = y - server->dialog_y;
+			double pad = 24.0, btn_gap = 12.0;
+			double content_w = server->width - 2 * pad;
+			if (server->dialog_btn2[0]) {
+				if (server->dialog_stacked) {
+					if (x >= pad && x <= pad + content_w) {
+						if (dy >= server->dialog_btn_y && dy <= server->dialog_btn_y + server->dialog_btn_h) {
+							hap(server, HAP_TAP, HG_SYSTEM);
+							dialog_handle_action(server, server->dialog_act1);
+							dialog_close(server);
+							p->role = ROLE_NONE;
+							return;
+						} else if (dy >= server->dialog_btn_y + server->dialog_btn_h + 12.0 &&
+								   dy <= server->dialog_btn_y + 2 * server->dialog_btn_h + 12.0) {
+							hap(server, HAP_TAP, HG_SYSTEM);
+							dialog_handle_action(server, server->dialog_act2);
+							dialog_close(server);
+							p->role = ROLE_NONE;
+							return;
+						}
+					}
+				} else {
+					double btn_w = (content_w - btn_gap) / 2.0;
+					if (dy >= server->dialog_btn_y && dy <= server->dialog_btn_y + server->dialog_btn_h) {
+						if (x >= pad && x <= pad + btn_w) {
+							hap(server, HAP_TAP, HG_SYSTEM);
+							dialog_handle_action(server, server->dialog_act1);
+							dialog_close(server);
+							p->role = ROLE_NONE;
+							return;
+						} else if (x >= pad + btn_w + btn_gap && x <= pad + 2 * btn_w + btn_gap) {
+							hap(server, HAP_TAP, HG_SYSTEM);
+							dialog_handle_action(server, server->dialog_act2);
+							dialog_close(server);
+							p->role = ROLE_NONE;
+							return;
+						}
+					}
+				}
+			} else {
+				if (dy >= server->dialog_btn_y && dy <= server->dialog_btn_y + server->dialog_btn_h) {
+					if (x >= pad && x <= pad + content_w) {
+						hap(server, HAP_TAP, HG_SYSTEM);
+						dialog_handle_action(server, server->dialog_act1);
+						dialog_close(server);
+						p->role = ROLE_NONE;
+						return;
+					}
+				}
+			}
+		} else if (y > server->dialog_y + server->dialog_h) {
+			/* Tap on dim area below dialog closes it, exactly as in ztOS python SDK mousePressEvent */
+			hap(server, HAP_TAP, HG_SYSTEM);
+			dialog_close(server);
+		}
+		p->role = ROLE_NONE;
+		return;
 	}
 	if (server->volume_y > -10.0f && y < banner_h(server) && !server->locked) {
 		/* the volume banner: its three buttons work the player */
@@ -6378,8 +6687,9 @@ static void ctl_command(struct zt_server *server, char *line) {
 		server->record_until = now_ms() + (uint32_t)id;
 		wlr_log(WLR_INFO, "recording frames for %d ms into /tmp/ztrec", id);
 	} else if (sscanf(line, "brightness %d", &id) == 1) {
-		/* from an ambient light program: 10..100 */
+		/* from an ambient light program or settings: 10..100 */
 		server->shade_brightness = id < 10 ? 10 : id > 100 ? 100 : id;
+		backlight_set(server->shade_brightness);
 		damage(server);
 	} else if (sscanf(line, "tone %d", &id) == 1) {
 		/* colour temperature in Kelvin; 6500 is none */
@@ -6393,6 +6703,46 @@ static void ctl_command(struct zt_server *server, char *line) {
 	} else if (strncmp(line, "screen on", 9) == 0) {
 		screen_set(server, true);
 		activity(server);
+	} else if (strncmp(line, "dialog_sensorhub", 16) == 0) {
+		dialog_show(server, "ztOSCoreSensorFramework",
+			"Sensor hub failed to initialize, please boot into twrp, go to reboot, and select system to hot-boot the sensor hub.",
+			"reboot to recovery", "reboot_recovery",
+			"stop sensor hub in this boot", "stop_sensorhub");
+	} else if (strncmp(line, "dialog_close", 12) == 0) {
+		dialog_close(server);
+	} else if (strncmp(line, "dialog ", 7) == 0) {
+		/* dialog TITLE|TEXT|BTN1:ACT1|BTN2:ACT2 */
+		char *f[4] = { line + 7, "", "", "" };
+		for (int k = 1; k < 4; k++) {
+			char *bar = strchr(f[k - 1], '|');
+			if (!bar) break;
+			*bar = 0;
+			f[k] = bar + 1;
+		}
+		char b1[64] = "OK", a1[64] = "dismiss", b2[64] = "", a2[64] = "";
+		char *c1 = strchr(f[2], ':');
+		if (c1) {
+			*c1 = 0;
+			snprintf(b1, sizeof(b1), "%s", f[2]);
+			snprintf(a1, sizeof(a1), "%s", c1 + 1);
+		} else if (f[2][0]) {
+			snprintf(b1, sizeof(b1), "%s", f[2]);
+			snprintf(a1, sizeof(a1), "%s", f[2]);
+		}
+		char *c2 = strchr(f[3], ':');
+		if (c2) {
+			*c2 = 0;
+			snprintf(b2, sizeof(b2), "%s", f[3]);
+			snprintf(a2, sizeof(a2), "%s", c2 + 1);
+		} else if (f[3][0]) {
+			snprintf(b2, sizeof(b2), "%s", f[3]);
+			snprintf(a2, sizeof(a2), "%s", f[3]);
+		}
+		dialog_show(server, f[0], f[1], b1, a1, b2, a2);
+	} else if (strncmp(line, "wifi_suspend on", 15) == 0) {
+		server->wifi_suspend = true;
+	} else if (strncmp(line, "wifi_suspend off", 16) == 0) {
+		server->wifi_suspend = false;
 	} else if (strncmp(line, "state", 5) == 0) {
 		int mapped = 0;
 		struct zt_toplevel *tl;
@@ -7107,6 +7457,16 @@ static void render_frame(struct zt_server *server) {
 	if (server->toast_y > 1.0f - TOAST_H && server->toast_layer.tex) {
 		layer_draw(server, &server->toast_layer, 0, server->toast_y, 1.0f);
 	}
+	if (server->dialog_y > 1.0f - (float)server->dialog_h && server->dialog_layer.tex) {
+		float t = (server->dialog_y + (float)server->dialog_h) / (float)server->dialog_h;
+		if (t > 0.01f) {
+			float m[16];
+			mat_identity(m);
+			mat_scale(m, server->width, server->height);
+			quad(server, GL_TEXTURE_2D, server->black_tex, m, 0.627f * fminf(1.0f, t), false, false, 1.0f, 1.0f);
+		}
+		layer_draw(server, &server->dialog_layer, 0, server->dialog_y, 1.0f);
+	}
 	if (server->show_touches) {
 		for (int i = 0; i < MAX_TOUCH; i++) {
 			struct touch_point *p = &server->touches[i];
@@ -7143,9 +7503,15 @@ static void render_frame(struct zt_server *server) {
 		quad(server, GL_TEXTURE_2D, server->tone_tex, m, 1.0f, false, true, 1.0f, 1.0f);
 		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 	}
-	if (server->shade_brightness < 100) {
-		/* no backlight to turn down on this kernel, and the panel is an
-		 * OLED: darker pixels are a dimmer screen */
+	/* Only fall back to pixel darkening overlay if there is no hardware backlight device */
+	static int has_hw_bl = -1;
+	if (has_hw_bl < 0) {
+		glob_t g;
+		has_hw_bl = (glob("/sys/class/backlight/*/brightness", 0, NULL, &g) == 0 && g.gl_pathc > 0) ? 1 : 0;
+		globfree(&g);
+	}
+	if (!has_hw_bl && server->shade_brightness < 100) {
+		/* Fallback: no hardware backlight device, so dim pixels via software overlay */
 		float m[16];
 		mat_identity(m);
 		mat_scale(m, server->width, server->height);
@@ -7505,6 +7871,8 @@ int main(int argc, char *argv[]) {
 	server.volume = 10;
 	server.volume_y = -(VOLUME_H + MEDIA_H);
 	server.toast_y = -TOAST_H;
+	server.dialog_h = 240;
+	server.dialog_y = -240.0f;
 	server.drop_card = -1;
 	server.shade_brightness = 50;	/* until the config says what it was left at */
 	server.shade_wifi = wifi_up();

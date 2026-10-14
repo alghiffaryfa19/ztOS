@@ -11,7 +11,7 @@ S9 (starlte) and in the QEMU emulator.
 
 **To install it:** `installer/ztos` (see [installer/README.md](installer/README.md)).
 
-**Jump to:** [Screenshots](#screenshots) · [Status: what works](#status) · [**Known quirks**](#known-quirks) (read before flashing) · [What is where](#what-is-where) · [The SDK](sdk/README.md)
+**Jump to:** [Screenshots](#screenshots) · [Status: what works](#status) · [**Known quirks**](#known-quirks) (read before flashing) · [What is where](#what-is-where) · [The SDK](sdk/README.md) · [License](#license)
 
 ## Screenshots
 
@@ -79,7 +79,7 @@ notes say what. **Broken**: tried, does not work. **Not started**: nothing yet.
 | Input | Notification light | Works | Charging, charged, low battery (breathing), rapid boost (white blink) |
 | 3D | GPU | Works | Mali-G72 MC18 through Panfrost, OpenGL ES 3.1 |
 | CPU | All 8 cores, frequency scaling | Works | The big cores are powered down when idle and brought back on demand (zrnperfd) |
-| CPU | Suspend | Broken | The M3 cores do not come back; idle power-down (`zrn-cpuidle`) is an opt-in experiment |
+| CPU | Suspend / Idle Power-Down | Works | Per-core C2 power-down active on efficiency cores via zrn-cpuidle with MCT hardware broadcast timer; big cores dynamically offlined via zrnperfd with Rapid Boost |
 | Power | Battery and charger | Works | MAX17042 gauge, MAX77705 charger |
 | Network | Wi-Fi | Works | BCM4361; join, forget, details and per-network signal in Settings |
 | Network | Bluetooth | Not started | |
@@ -628,3 +628,8 @@ The proxy is GET-only and refuses anything that is not an Arch Linux ARM mirror.
    `CPU_SUSPEND` resume), no suspend. Expect the phone to stay warm and drain
    on battery.
 5. **Audio, camera, modem, Bluetooth**: not started anywhere on this SoC.
+ 
+## License
+
+* **ztOS Userspace & Applications** (`ztmetro/`, `os/`, `sdk/`, installer, and system daemons): Licensed under the [GNU General Public License v3.0 or later](LICENSE) (**GPL-3.0-or-later**).
+* **Linux Kernel Drivers & Device Trees** (`power/`, `haptics/`, `third_party/`, kernel patches, and DTS files): Licensed under the [GNU General Public License v2.0 only](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html) (**GPL-2.0-only**), conforming to upstream Linux kernel licensing terms.

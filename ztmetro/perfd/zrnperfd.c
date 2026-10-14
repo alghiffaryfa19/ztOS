@@ -98,12 +98,10 @@ static const int clusters[] = { 0, 4 };
 
 static enum profile profile = BALANCED;
 static bool deepsleep = true, screen_on = true;
-/* After the screen has been off for WIFI_OFF_MS on battery, the Wi-Fi radio is
- * switched off (measured: 70 mA of ~600 mA idle); it comes back with the screen
- * or the charger. */
-#define WIFI_OFF_MS (5 * 60 * 1000L)
-static bool wifi_idle_off = true, wifi_is_off;
-static long screen_off_at;
+/* The Wi-Fi radio and the modem are never switched off with the screen: a phone that
+ * stops receiving while it sleeps is not a phone. The Wi-Fi chip's own power save
+ * (listening only for beacons) is on all the time, and ztOSCoreNetworking lowers its
+ * polling with the screen. */
 /* tickle mode on battery, plugged in, and in power saver */
 static enum tickle_mode tickle_when[3] = { TICKLE_MODERATE, TICKLE_NOMINAL, TICKLE_HIGH };
 static const char *const conditions[3] = { "battery", "charging", "saver" };
@@ -438,15 +436,6 @@ static bool boost_sample(void) {
 	return boost != was;
 }
 
-static void wifi_stage(void) {
-	bool want = wifi_idle_off && !screen_on && !plugged && screen_off_at &&
-		    boost_ms() - screen_off_at >= WIFI_OFF_MS;
-	if (want != wifi_is_off) {
-		if (system(want ? "nmcli radio wifi off >/dev/null 2>&1 &" : "nmcli radio wifi on >/dev/null 2>&1 &")) {}
-		wifi_is_off = want;
-	}
-}
-
 static void apply(void) {
 	bool low = !screen_on && deepsleep;
 	char path[160];
@@ -602,8 +591,6 @@ static int command(char *line, bool persist) {
 		deepsleep = strcmp(value, "on") == 0;
 	} else if (strcmp(what, "screen") == 0) {
 		screen_on = strcmp(value, "off") != 0;
-		screen_off_at = screen_on ? 0 : boost_ms();
-		wifi_stage();
 		persist = false;
 		tickle_screen(screen_on);
 		/* the modem daemon asks for the signal less often, */
@@ -683,12 +670,6 @@ int main(void) {
 		/* while the boost is watching, a look four times a second; asleep
 		 * and in the performance profile nothing wakes for it */
 		int wait = tickle_timeout();
-		if (wifi_idle_off && !screen_on && !wifi_is_off && screen_off_at) {
-			long left = WIFI_OFF_MS - (boost_ms() - screen_off_at);
-			if (wait < 0 || wait > left) {
-				wait = left < 1 ? 1 : (int)left + 50;
-			}
-		}
 		if (boost_live() && (wait < 0 || wait > BOOST_SAMPLE_MS)) {
 			wait = BOOST_SAMPLE_MS;
 		}
@@ -748,7 +729,6 @@ int main(void) {
 				}
 			}
 		}
-		wifi_stage();
 		tickle_ready(fds + 2, n - 2);
 		if (tickle_run() && !changed) {
 			changed = 1;	/* an app paused, resumed, or started playing */

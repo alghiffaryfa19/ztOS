@@ -42,6 +42,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -58,6 +59,7 @@
 #define MARKS		"/var/lib/ztoscsf"
 #define RUN_DIR		"/run/ztoscsf"
 #define STATUS		RUN_DIR "/status"
+#define CSF_CTL		"/run/ztoscsf.ctl"
 #define PERIOD_S	60	/* (every look runs a program or two: not more often than this) */
 #define QUIET_S		600	/* one report per piece in this long */
 #define START_GRACE_S	100	/* how long a unit may take to come up at first */
@@ -81,7 +83,7 @@ struct part {
 
 static struct part parts[MAX_PARTS];
 static int n_parts;
-static char queue[MAX_QUEUE][280];
+static char queue[MAX_QUEUE][512];
 static int q_len;
 static long started_at;
 static int kernel_faults = -1;
@@ -463,6 +465,77 @@ static void battery_look(void)
 	}
 }
 
+static void sensorhub_look(void)
+{
+	static bool dialog_shown = false;
+	if (access("/run/ztoscsf-sensorhub.stopped", F_OK) == 0 ||
+	    access("/run/sensorhub.stopped", F_OK) == 0) {
+		return;
+	}
+	if (dialog_shown) {
+		return;
+	}
+
+	/* Wait at least 25 seconds after boot for BCM4773 patch attempt */
+	if (now_s() - started_at < 25) {
+		return;
+	}
+
+	bool failed = false;
+
+	/* 1. Check if ready != 1 */
+	FILE *rf = fopen("/sys/class/sec/sensorhub/ready", "r");
+	if (rf) {
+		int ready = 0;
+		if (fscanf(rf, "%d", &ready) != 1 || ready != 1) {
+			failed = true;
+		}
+		fclose(rf);
+	} else {
+		failed = true;
+	}
+
+	/* 2. Check if sensorhub units failed */
+	if (!failed) {
+		if (run("systemctl is-failed -q zrn-sensorhub.service 2>/dev/null") == 0 ||
+		    run("systemctl is-failed -q ztoscsf-sensorhub.service 2>/dev/null") == 0 ||
+		    run("systemctl is-failed -q zrnsensord.service 2>/dev/null") == 0 ||
+		    run("systemctl is-failed -q ztoscsf-sensord.service 2>/dev/null") == 0) {
+			failed = true;
+		}
+	}
+
+	if (failed) {
+		say("Sensor hub failed to initialize: showing Lumia Metro dialog");
+		dialog_shown = true;
+		char cmd[512];
+		snprintf(cmd, sizeof(cmd),
+			"dialog ztOSCoreSensorFramework|Sensor hub failed to initialize, please boot into twrp, go to reboot, and select system to hot-boot the sensor hub.|reboot to recovery:reboot_recovery|stop sensor hub in this boot:stop_sensorhub\n");
+		if (!shell_tell(cmd)) {
+			if (q_len < MAX_QUEUE) {
+				snprintf(queue[q_len++], sizeof(queue[0]), "%s", cmd);
+			}
+		}
+	}
+}
+
+static void ctl_handle(const char *cmd)
+{
+	say("ctl command: %s", cmd);
+	if (strncmp(cmd, "reboot_recovery", 15) == 0) {
+		say("rebooting to recovery as requested");
+		run("reboot recovery");
+		run("systemctl reboot");
+	} else if (strncmp(cmd, "stop_sensorhub", 14) == 0) {
+		say("stopping sensor hub for this boot session");
+		int fd = open("/run/ztoscsf-sensorhub.stopped", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+		if (fd >= 0) close(fd);
+		fd = open("/run/sensorhub.stopped", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+		if (fd >= 0) close(fd);
+		run("systemctl stop zrn-sensorhub.service ztoscsf-sensorhub.service zrnsensord.service ztoscsf-sensord.service 2>/dev/null");
+	}
+}
+
 static void look(bool first)
 {
 	units_look(first);
@@ -491,6 +564,7 @@ static void look(bool first)
 	}
 	kernel_look();
 	battery_look();
+	sensorhub_look();
 	publish();
 	queue_flush();
 }
@@ -576,12 +650,38 @@ int main(int argc, char **argv)
 	load_parts();
 	say("%s: %d components", NAME, n_parts);
 	start_all();
+
+	unlink(CSF_CTL);
+	if (mkfifo(CSF_CTL, 0666) == 0) {
+		chmod(CSF_CTL, 0666);
+	}
+	int ctl_fd = open(CSF_CTL, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+
 	sleep(3);
 	look(true);
 	for (;;) {
 		/* closer together while things are still coming up */
-		sleep(now_s() - started_at < START_GRACE_S ? 6 : PERIOD_S);
+		int wait_s = now_s() - started_at < START_GRACE_S ? 6 : PERIOD_S;
+		if (ctl_fd >= 0) {
+			struct pollfd pfd = { .fd = ctl_fd, .events = POLLIN };
+			int ret = poll(&pfd, 1, wait_s * 1000);
+			if (ret > 0 && (pfd.revents & POLLIN)) {
+				char buf[256];
+				ssize_t n = read(ctl_fd, buf, sizeof(buf) - 1);
+				if (n > 0) {
+					buf[n] = 0;
+					char *save = NULL;
+					for (char *line = strtok_r(buf, "\r\n", &save); line; line = strtok_r(NULL, "\r\n", &save)) {
+						ctl_handle(line);
+					}
+				}
+			}
+		} else {
+			sleep(wait_s);
+		}
 		look(false);
 	}
+	if (ctl_fd >= 0) close(ctl_fd);
+	unlink(CSF_CTL);
 	return 0;
 }

@@ -176,6 +176,8 @@ static inline bool modem_tell(const char *fmt, ...)
 	line[n++] = '\n';
 	int fd = open(MODEM_CTL, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 	if (fd < 0)
+		fd = open("/run/zrn-modem.ctl", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0)
 		return false;
 	bool ok = write(fd, line, (size_t)n) == n;
 	close(fd);
@@ -188,6 +190,8 @@ static inline void modem_value(const char *key, char *out, size_t size)
 	size_t len = strlen(key);
 	out[0] = 0;
 	FILE *f = fopen(MODEM_STATUS, "r");
+	if (!f)
+		f = fopen("/run/zrn-modem/status", "r");
 	while (f && fgets(line, sizeof(line), f)) {
 		if (!strncmp(line, key, len) && line[len] == '=') {
 			line[strcspn(line, "\r\n")] = 0;

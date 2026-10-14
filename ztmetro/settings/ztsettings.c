@@ -65,6 +65,7 @@ enum action {
 	ACT_COLUMNS,
 	ACT_HAPTICS,
 	ACT_WIFI_RADIO,
+	ACT_WIFI_SUSPEND,
 	ACT_WIFI_CONNECT,
 	ACT_WIFI_RESCAN,
 	ACT_WIFI_PASSWORD,	/* the box */
@@ -168,6 +169,7 @@ static struct {
 	int scale_idx;
 
 	bool wifi_on, wifi_loading;
+	bool wifi_suspend;
 	struct network networks[MAX_NETWORKS];
 	int n_networks;
 	char wifi_status[96];
@@ -331,6 +333,8 @@ static void config_load(void) {
 			else if (t <= 180) app.timeout_idx = 2;
 			else if (t <= 300) app.timeout_idx = 3;
 			else app.timeout_idx = 4;
+		} else if (strcmp(key, "wifi_suspend") == 0) {
+			app.wifi_suspend = strcmp(val, "on") == 0 || strcmp(val, "1") == 0;
 		}
 	}
 	if (f) fclose(f);
@@ -434,10 +438,11 @@ static void perf_tell(const char *command) {
 	pipe_tell("/run/zrnperfd.ctl", command);
 }
 
-/* Auto brightness is ztoscsf-sensord's: it has the light sensor. */
+/* Auto brightness is sensord's: it has the light sensor. */
 static void auto_load(void) {
 	char line[64];
 	FILE *f = fopen("/run/ztoscsf-sensors/status", "r");
+	if (!f) f = fopen("/run/zrn-sensors/status", "r");
 	app.autobrightness = false;	/* no daemon, no sensor */
 	while (f && fgets(line, sizeof(line), f)) {
 		if (strncmp(line, "auto=", 5) == 0) {
@@ -449,21 +454,23 @@ static void auto_load(void) {
 
 static void config_save(void) {
 	static const int timeouts[] = { 30, 60, 180, 300, 0 };
-	enum { N_KEYS = 12 + N_HAPTIC_GROUPS };
+	enum { N_KEYS = 13 + N_HAPTIC_GROUPS };
 	struct { const char *key; char value[128]; bool written; } keys[N_KEYS] = {
 		{ .key = "accent" }, { .key = "columns" }, { .key = "haptics" },
 		{ .key = "brightness" }, { .key = "timeout" }, { .key = "demo_tiles" },
 		{ .key = "slow_motion" }, { .key = "show_touches" }, { .key = "lock" },
 		{ .key = "menu_speed" }, { .key = "haptic_strength" }, { .key = "quick" },
+		{ .key = "wifi_suspend" },
 	};
 	snprintf(keys[10].value, 32, "%d", app.haptic_strength);
 	for (int i = 0; i < 8; i++) {
 		size_t at = strlen(keys[11].value);
 		snprintf(keys[11].value + at, sizeof(keys[11].value) - at, "%s%s", i ? "," : "", QUICK_IDS[app.quick[i]]);
 	}
+	snprintf(keys[12].value, 32, "%s", app.wifi_suspend ? "on" : "off");
 	for (int g = 0; g < N_HAPTIC_GROUPS; g++) {
-		keys[12 + g].key = HAPTIC_GROUPS[g].key;
-		snprintf(keys[12 + g].value, 32, "%d", app.haptic_group[g]);
+		keys[13 + g].key = HAPTIC_GROUPS[g].key;
+		snprintf(keys[13 + g].value, 32, "%d", app.haptic_group[g]);
 	}
 	snprintf(keys[0].value, 32, "%s", ACCENTS[app.accent].name);
 	snprintf(keys[1].value, 32, "%d", app.columns);
@@ -719,6 +726,7 @@ static char apn_note[96];
 static void cell_load(void) {
 	char line[128];
 	FILE *f = fopen("/run/ztoscorenetworking/status", "r");
+	if (!f) f = fopen("/run/zrn-modem/status", "r");
 	memset(&cell, 0, sizeof(cell));
 	cell.known = f != NULL;
 	while (f && fgets(line, sizeof(line), f)) {
@@ -863,6 +871,7 @@ static double draw_theme(cairo_t *cr) {
 }
 
 static double draw_display(cairo_t *cr) {
+	auto_load();
 	double y = zmc_header(cr, "display");
 
 	zmc_slider(cr, MARGIN, y, zmc.width - 2 * MARGIN, app.brightness, "Screen brightness", ACT_BRIGHTNESS_STEP);
@@ -912,6 +921,7 @@ static int wifi_menu_items(const struct network *n, const char *items[3]) {
 static double draw_wifi(cairo_t *cr) {
 	double y = zmc_header(cr, "Wi-Fi");
 	y = zmc_switch(cr, y, "Wi-Fi networking", app.wifi_on, ACT_WIFI_RADIO);
+	y = zmc_switch(cr, y, "Suspend Wi-Fi on sleep", app.wifi_suspend, ACT_WIFI_SUSPEND);
 
 	if (app.wifi_status[0]) {
 		zmc_set_rgb(cr, ACCENTS[app.accent].color);
@@ -1071,10 +1081,12 @@ static void apn_save(void) {
 		"password = %s\nauth = %s\n", apn_field[0], apn_field[1], apn_field[2], auths[apn_auth]);
 	fclose(f);
 	pipe_tell("/run/ztoscorenetworking.ctl", "apn\n");
+	pipe_tell("/run/zrn-modem.ctl", "apn\n");
 	snprintf(apn_note, sizeof(apn_note), "saved; reconnecting with it");
 }
 
 static double draw_mobile(cairo_t *cr) {
+	cell_load();
 	double y = zmc_header(cr, "cellular + SIM");
 	char value[128];
 	if (!cell.known) {
@@ -1626,6 +1638,16 @@ static void activate(int action, int arg) {
 		app.wifi_on = !app.wifi_on;
 		wifi_refresh(app.wifi_on ? "sleep 3" : NULL);
 		break;
+	case ACT_WIFI_SUSPEND:
+		app.wifi_suspend = !app.wifi_suspend;
+		config_save();
+		{
+			const char *runtime = getenv("XDG_RUNTIME_DIR");
+			char ctl_path[256];
+			snprintf(ctl_path, sizeof(ctl_path), "%s/ztmetro.ctl", runtime ? runtime : "/tmp");
+			pipe_tell(ctl_path, app.wifi_suspend ? "wifi_suspend on\n" : "wifi_suspend off\n");
+		}
+		break;
 	case ACT_WIFI_MENU_CLOSE:
 		wifi_menu = -1;
 		break;
@@ -1791,6 +1813,7 @@ static void activate(int action, int arg) {
 	case ACT_AUTOBRIGHTNESS:
 		app.autobrightness = !app.autobrightness;
 		pipe_tell("/run/ztoscsf-sensord.ctl", app.autobrightness ? "auto on\n" : "auto off\n");
+		pipe_tell("/run/zrn-sensord.ctl", app.autobrightness ? "auto on\n" : "auto off\n");
 		if (!app.autobrightness) {
 			config_save();	/* back to the level the slider shows */
 		}
@@ -1810,6 +1833,7 @@ static void activate(int action, int arg) {
 		app.mobile_data = !app.mobile_data;
 		cell.data_on = app.mobile_data;
 		pipe_tell("/run/ztoscorenetworking.ctl", app.mobile_data ? "data on\n" : "data off\n");
+		pipe_tell("/run/zrn-modem.ctl", app.mobile_data ? "data on\n" : "data off\n");
 		break;
 	case ACT_ROAMING:
 		app.roaming = !app.roaming;
@@ -1901,9 +1925,17 @@ static void slide(int action, int value, bool done) {
 	switch (action) {
 	case ACT_BRIGHTNESS_STEP:
 		app.brightness = value < 10 ? 10 : value;
-		/* the shell dims the screen as this is dragged, a few times a second */
-		if (done || zmc_now_ms() - saved > 80) {
+		/* send live brightness to the shell without reloading config/textures */
+		if (done || zmc_now_ms() - saved > 40) {
 			saved = zmc_now_ms();
+			char ctl_cmd[32];
+			snprintf(ctl_cmd, sizeof(ctl_cmd), "brightness %d\n", app.brightness);
+			const char *runtime = getenv("XDG_RUNTIME_DIR");
+			char ctl_path[256];
+			snprintf(ctl_path, sizeof(ctl_path), "%s/ztmetro.ctl", runtime ? runtime : "/tmp");
+			pipe_tell(ctl_path, ctl_cmd);
+		}
+		if (done) {
 			config_save();
 		}
 		break;

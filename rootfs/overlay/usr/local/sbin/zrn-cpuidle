@@ -17,7 +17,9 @@
 D=/var/lib/zrn-cpuidle
 MARK=$D/loading
 KO=/usr/lib/modules/$(uname -r)/extra/zrn-cpuidle.ko
-CPUS=${ZRN_CPUIDLE_CPUS:-0x7e}
+# Cores 2 and 3 (Cortex-A55) can power down stably (0x0c).
+# Core 0 handles MCT broadcast; Core 1 and M3 cores (4-7) must stay awake.
+CPUS=${ZRN_CPUIDLE_CPUS:-0x0c}
 mkdir -p $D
 
 load() {
@@ -27,10 +29,12 @@ load() {
 		echo "zrn-cpuidle: the last load did not finish (the phone froze or restarted); not loading. Remove $MARK to try again."
 		return 1
 	fi
-	A=$(awk '$3=="psci_cpu_suspend_enter"{print $1}' /proc/kallsyms)
-	[ -n "$A" ] && [ "$A" != 0000000000000000 ] || { echo "zrn-cpuidle: psci_cpu_suspend_enter not found (kptr_restrict?)"; return 1; }
+	S=$(awk '$3=="cpu_suspend"{print $1}' /proc/kallsyms)
+	R=$(awk '$3=="cpu_resume"{print $1}' /proc/kallsyms)
+	[ -n "$S" ] && [ "$S" != 0000000000000000 ] || { echo "zrn-cpuidle: cpu_suspend not found (kptr_restrict?)"; return 1; }
+	[ -n "$R" ] && [ "$R" != 0000000000000000 ] || { echo "zrn-cpuidle: cpu_resume not found (kptr_restrict?)"; return 1; }
 	touch $MARK; sync
-	insmod "$KO" suspend_enter=0x$A cpus=$CPUS || { rm -f $MARK; echo "zrn-cpuidle: the module did not load"; return 1; }
+	insmod "$KO" suspend_enter=0x$S resume=0x$R cpus=$CPUS || { rm -f $MARK; echo "zrn-cpuidle: the module did not load"; return 1; }
 	echo "zrn-cpuidle: loaded for cores $CPUS"
 	# a freeze shows within seconds of the cores first sleeping; two minutes is ample
 	( sleep 120; rm -f $MARK; sync ) > /dev/null 2>&1 &

@@ -179,6 +179,8 @@ if [ -n "$DECON" ]; then
 	cfg --enable DRM_S9P_DECON
 	cfg --enable DRM_KMS_HELPER
 	cfg --enable DRM_GEM_DMA_HELPER
+	# the panel's own brightness (AOR), as a backlight device
+	cfg --enable BACKLIGHT_CLASS_DEVICE
 else
 	cfg --disable DRM_S9P_DECON
 fi

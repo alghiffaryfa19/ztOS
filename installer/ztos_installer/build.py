@@ -170,6 +170,17 @@ cp -a "$SRC/os/overlay-$TARGET/." "$R/"
 if [ "$TARGET" = starlte ]; then
 	cp -a "$SRC/rootfs/overlay/." "$R/"         # the phone's own: USB link, charger, fallbacks
 	install -Dm644 -t "$R/usr/lib/firmware/brcm" "$SRC"/firmware/*
+	for moddir in "$R"/usr/lib/modules/*; do
+		[ -d "$moddir" ] || continue
+		kver=$(basename "$moddir")
+		install -d "$moddir/extra"
+		for k in "$SRC"/power/idle/zrn-cpuidle.ko "$SRC"/haptics/zrn-haptic.ko \
+		         "$SRC"/power/hotplug/zrn-hotplug.ko "$SRC"/leds/zrn-led.ko \
+		         "$SRC"/sensors/driver/zrn-bbd.ko "$SRC"/audio/driver/snd-zrn-abox.ko; do
+			[ -f "$k" ] && install -m644 "$k" "$moddir/extra/"
+		done
+		ch depmod -a "$kver" > /dev/null 2>&1 || true
+	done
 fi
 install -d "$R/usr/local/share/fonts/selawik"
 install -m644 "$SRC"/os/fonts/selawik/*.ttf "$R/usr/local/share/fonts/selawik/"
@@ -206,6 +217,12 @@ ch passwd -l root > /dev/null
 install -Dm440 /dev/stdin "$R/etc/sudoers.d/10-wheel" <<'SUDO'
 %wheel ALL=(ALL:ALL) ALL
 SUDO
+if [ -d "$R/etc/sudoers.d" ]; then
+	chmod 440 "$R"/etc/sudoers.d/* 2>/dev/null || true
+	if [ "$USERNAME" != alarm ] && [ -f "$R/etc/sudoers.d/99-ztos-alarm" ]; then
+		sed -i "s/^alarm /$USERNAME /" "$R/etc/sudoers.d/99-ztos-alarm"
+	fi
+fi
 sed -i "s/@USER@/$USERNAME/" "$R/etc/greetd/config.toml"
 
 step "time, language and name"
@@ -225,7 +242,7 @@ for u in systemd-networkd getty@tty1; do
 	ch systemctl disable "$u" > /dev/null 2>&1 || true
 done
 if [ "$TARGET" = starlte ]; then
-	for u in zboot-usb-gadget zboot-firstboot zboot-charge-hold zrn-charge ztoscirrusaudio ztoscsf-sensorhub \
+	for u in zboot-usb-gadget zboot-firstboot zboot-charge-hold zrn-charge zrn-cpuidle ztoscirrusaudio ztoscsf-sensorhub \
 			ztoscsf-sensord ztoscorenetworking-modem ztoscorenetworking zrnperfd ztos-panel-selfmask; do
 		ch systemctl enable "$u" > /dev/null 2>&1 || echo "(no $u)"
 	done

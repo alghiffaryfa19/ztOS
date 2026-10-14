@@ -280,7 +280,7 @@ static double draw_hardware(cairo_t *cr) {
 		{ "Wi-Fi (brcmfmac)", "/sys/class/net/wlp1s0", "no Wi-Fi interface" },
 		{ "Battery gauge (MAX77705)", "/sys/class/power_supply/max170xx_battery", "no gauge" },
 		{ "Sound card", "/proc/asound/cards", "none: no codec or audio DSP driver" },
-		{ "Backlight device", "/sys/class/backlight/panel", "none: brightness is done by the shell" },
+		{ "Backlight device", "/sys/class/backlight/s9p-panel", "none: brightness is done by the shell" },
 		{ "Light and motion sensors", "/sys/bus/iio/devices/iio:device0", "none: no sensor hub driver" },
 		{ "Vibrator", "/sys/class/leds/vibrator", "none: no haptics driver" },
 		{ "Modem", "/sys/class/net/wwan0", "none: no modem driver" },

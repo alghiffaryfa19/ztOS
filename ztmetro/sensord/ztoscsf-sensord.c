@@ -59,7 +59,7 @@ static struct sensor {
 	bool on, wanted;
 	time_t until;	/* a watch runs out; 0 is never */
 } sensors[] = {
-	{ "light", 9, 18, 5000 },	/* one reading every 5 s: the hub wakes us rarely */
+	{ "light", 9, 18, 1000 },	/* 1 reading every second: fast enough for smooth auto-brightness */
 	{ "accel", 0, 6, 200 },
 	{ "gyro", 1, 12, 200 },
 	{ "pressure", 5, 6, 1000 },
@@ -194,16 +194,34 @@ static void brightness_show(int percent) {
 	shell(line);
 }
 
-/* the same curve as AutoBrightnessLinux: log10(lux) over five decades */
+/* Softer, calibrated AMOLED brightness curve tailored to human eye response:
+ * Dim rooms (1-50 lux): 8% - 20%
+ * Office / indoor (100-500 lux): 22% - 38%
+ * Bright daylight / direct sun (1000-50000+ lux): 45% - 100%
+ */
 static int lux_to_percent(double lux) {
-	int percent = lux < 1 ? 0 : (int)lround(log10(lux) / 5.0 * 100);
-	return percent < 10 ? 10 : percent > 100 ? 100 : percent;
+	double pct;
+	if (lux < 1.0) {
+		pct = 5.0;
+	} else if (lux < 100.0) {
+		pct = 8.0 + (log10(lux) / 2.0) * 14.0;
+	} else if (lux < 1000.0) {
+		pct = 22.0 + ((log10(lux) - 2.0) / 1.0) * 23.0;
+	} else {
+		pct = 45.0 + ((log10(lux) - 3.0) / 2.0) * 55.0;
+	}
+	int res = (int)lround(pct);
+	return res < 5 ? 5 : res > 100 ? 100 : res;
 }
 
 static void light(uint32_t lux) {
-	/* readings are 5 s apart, so each counts in full; the 4-point dead band
-	 * below is what keeps flicker from moving the screen */
-	lux_smooth = lux;
+	/* Exponential moving average filter: smooths out jitter, fluctuations, and jumps */
+	if (lux_smooth < 0) {
+		lux_smooth = lux;
+	} else {
+		/* alpha = 0.25 (gradual rolling adaptation) */
+		lux_smooth = lux_smooth * 0.75 + (double)lux * 0.25;
+	}
 	if (!auto_on) {
 		return;
 	}
@@ -211,7 +229,7 @@ static void light(uint32_t lux) {
 	if (goal < 0) {	/* the first reading since the screen came on: no ramp */
 		goal = target;
 		brightness_show(goal);
-	} else if (abs(target - goal) >= 4) {
+	} else if (abs(target - goal) >= 2) {
 		goal = target;
 	}
 }
@@ -478,6 +496,11 @@ int main(void) {
 		return 1;
 	}
 	chmod(CTL, 0666);
+	/* Compatibility symlinks so legacy tools and paths find everything */
+	unlink("/run/zrn-sensord.ctl");
+	symlink(CTL, "/run/zrn-sensord.ctl");
+	unlink("/run/zrn-sensors");
+	symlink(OUT, "/run/zrn-sensors");
 	/* read and write: with no writer left a read-only pipe reads as closed */
 	FILE *ctl = fopen(CTL, "r+");
 	if (!ctl) {

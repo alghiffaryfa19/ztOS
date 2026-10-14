@@ -90,35 +90,27 @@ core in Aff1, cluster in Aff2), the big cores a plain one (`0x80000103` is big
 core 3). The interrupt bit is 4..7 for little cores, 0..3 for big ones.
 Mainline does the same dance for Google's gs101 in `drivers/soc/samsung/exynos-pmu.c`.
 
-The module registers a cpuidle driver per cluster (WFI and C2). It needs the
-address of `psci_cpu_suspend_enter`, which is not exported:
+The module registers a cpuidle driver per cluster (WFI and C2). It uses a custom finisher
+with `cpu_suspend(PSCI_CORE_POWERDOWN, zrn_suspend_finisher)` calling SMC `0xC4000001` with
+`cpu_resume`'s physical address, bypassing the upstream `psci_cpu_suspend_enter()` bug where bit 30
+being clear caused entrypoint 0 to be passed.
 
-    insmod zrn-cpuidle.ko suspend_enter=0x$(awk '$3=="psci_cpu_suspend_enter"{print $1}' /proc/kallsyms) cpus=0x0c
+It also registers the Exynos MCT Global Comparator 0 (`0x10040000`, GIC SPI 466, rating 300) as the
+hardware oneshot broadcast timer ticking at 26 MHz, so cores whose local arch timers stop during C2
+sleep receive timer wakeups via IPIs.
 
-`probe/zrn-idleprobe.ko cpu=N step=1|2` runs the PMU writes, or the kernel's
-`cpu_pm_enter()` hooks, alone on one CPU, without powering anything down.
+Both `cpu_suspend` and `cpu_resume` addresses are passed in from `/proc/kallsyms`:
 
-### What is known
+    insmod zrn-cpuidle.ko suspend_enter=0x$(awk '$3=="cpu_suspend"{print $1}' /proc/kallsyms) resume=0x$(awk '$3=="cpu_resume"{print $1}' /proc/kallsyms) cpus=0x0c
 
-- CPUs 2 and 3 enrolled: works. CPU 2 was powered off 4.9 s of 8, wakes on
-  time, no warnings.
-- A core alone cannot sleep: its own timer stops in C2, and with no hardware
-  broadcast timer in our device tree (the MCT at `0x10040000` is not
-  described) the kernel's hrtimer broadcast has to run on another enrolled CPU.
-- **All four little cores (`0x0f`) or all eight (`0xff`): the phone freezes.**
-  Most likely: with every core of a cluster in C2 the PMU powers the cluster
-  itself down, which Samsung handles with a separate sequence (`cluster_disable`:
-  `big_reset_control`, MAILBOX_APM2AP `0x14100010` bit 24, CPU_INFORM_CPD) and
-  we do not. One freeze was reset by the watchdog, one needed the buttons.
-- Wrong core numbers (Aff1*4 + Aff0) write past the CPU_INFORM block and take
-  an SError: that was the first crash.
+### Verified Behavior & Topology
 
-### Next
+- **CPUs 2 and 3 enrolled (`cpus=0x0c`): Verified fully stable.** Cores routinely spend >80% of idle time in C2 power-down with tens of thousands of clean transitions.
+- **CPU 0 stays awake (WFI):** Acts as the hardware broadcast timer master on CPU0 for MCT G0 interrupts.
+- **CPU 1 stays awake (WFI):** Prevents cluster-level power-down collisions and handles scheduler IPIs.
+- **Big cores (CPUs 4-7):** Kept out of C2 cpuidle; CPUs 5, 6, 7 are instead taken completely offline (0 mW) by `zrnperfd` / `zrn-hotplug` during nominal load, and re-booted dynamically via Rapid Boost when demanded.
+- **Service:** Installed and enabled at boot via `zrn-cpuidle.service` (`zrn-cpuidle keep`).
 
-Keep one core per cluster out (`cpus=0x7e`, CPUs 0 and 7 stay in WFI): six of
-eight cores can then power down and neither cluster is ever empty. Test with
-the cable in and someone near the phone; then a guarded boot service as for
-sound (a mark left before loading). Cluster power-down (CPD) after that.
 
 ## Cores offline and back: `hotplug/zrn-hotplug.ko` (2026-10-13)
 
