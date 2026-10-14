@@ -109,15 +109,14 @@ def cmd_install(args):
         print(BANNER)
         print("Welcome to the ztOS Installer!\n")
         print("Choose an option:")
-        print("  1. Auto Download Prebuilt image and install (fastest, no compiling)")
-        print("  2. Build image in this PC and install")
-        print("  3. Build image in this PC and store")
-        print("  4. Reboot the phone from ztOS Rescue (it is stuck in Rescue)")
-        choice = prompt("1, 2, 3 or 4", "1", lambda a: None if a in ("1", "2", "3", "4") else "choose 1, 2, 3 or 4")
-        if choice == "4":
+        print("  1. Build image in this PC and install")
+        print("  2. Build image in this PC and store")
+        print("  3. Reboot the phone from ztOS Rescue (it is stuck in Rescue)")
+        choice = prompt("1, 2 or 3", "1", lambda a: None if a in ("1", "2", "3") else "choose 1, 2 or 3")
+        if choice == "3":
             t.reboot_from_rescue()
             return
-        mode = {"1": "download", "2": "build-install", "3": "build-store"}[choice]
+        mode = {"1": "build-install", "2": "build-store"}[choice]
     else:
         mode = mode or "build-install"
 
