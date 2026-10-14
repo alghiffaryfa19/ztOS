@@ -272,25 +272,58 @@ static bool exists(const char *path) {
 	return access(path, F_OK) == 0;
 }
 
+static bool check_part(size_t index) {
+	switch (index) {
+	case 0: /* Display */
+		return exists("/sys/class/drm/card0-DSI-1") || exists("/sys/class/drm/card1-DSI-1") || exists("/sys/class/graphics/fb0");
+	case 1: /* GPU */
+		return exists("/sys/class/devfreq/17500000.gpu") || exists("/sys/bus/platform/drivers/panfrost");
+	case 2: /* Touch */
+		return exists("/sys/bus/i2c/drivers/s6sy761") || exists("/sys/class/input/input1") || exists("/sys/class/input/input0");
+	case 3: /* Wi-Fi */
+		return exists("/sys/class/net/wlp1s0") || exists("/sys/class/net/wlan0") || exists("/sys/module/brcmfmac");
+	case 4: /* Battery gauge */
+		return exists("/sys/class/power_supply/max170xx_battery") || exists("/sys/class/power_supply/battery");
+	case 5: /* Sound card */
+		return exists("/proc/asound/ZrnAbox") || exists("/proc/asound/card0");
+	case 6: /* Backlight device */
+		return exists("/sys/class/backlight/s9p-panel") || exists("/sys/class/backlight");
+	case 7: /* Light and motion sensors */
+		return exists("/sys/bus/iio/devices/iio:device0") || exists("/sys/module/zrn_bbd") || exists("/run/ztoscsf/sensord.sock");
+	case 8: /* Vibrator */
+		return exists("/sys/module/zrn_haptic") || exists("/sys/bus/platform/drivers/zrn-haptic") || exists("/sys/class/leds/vibrator");
+	case 9: /* Modem */
+		return exists("/dev/umts_ipc0") || exists("/sys/class/net/rmnet0") || exists("/sys/module/zrn_modem") || exists("/sys/class/net/wwan0");
+	case 10: /* Bluetooth */
+		return exists("/sys/class/bluetooth/hci0");
+	case 11: /* Camera */
+		return exists("/dev/video0");
+	case 12: /* Processor idle states */
+		return exists("/sys/devices/system/cpu/cpu0/cpuidle") || exists("/sys/module/zrn_cpuidle");
+	default:
+		return false;
+	}
+}
+
 static double draw_hardware(cairo_t *cr) {
-	static const struct { const char *what, *path, *missing; } parts[] = {
-		{ "Display (DECON, DSI)", "/sys/class/drm/card0-DSI-1", "no panel" },
-		{ "GPU (Mali-G72, Panfrost)", "/sys/class/devfreq/17500000.gpu", "no GPU" },
-		{ "Touch (s6sy761)", "/sys/class/input/input1", "no touch" },
-		{ "Wi-Fi (brcmfmac)", "/sys/class/net/wlp1s0", "no Wi-Fi interface" },
-		{ "Battery gauge (MAX77705)", "/sys/class/power_supply/max170xx_battery", "no gauge" },
-		{ "Sound card", "/proc/asound/cards", "none: no codec or audio DSP driver" },
-		{ "Backlight device", "/sys/class/backlight/s9p-panel", "none: brightness is done by the shell" },
-		{ "Light and motion sensors", "/sys/bus/iio/devices/iio:device0", "none: no sensor hub driver" },
-		{ "Vibrator", "/sys/class/leds/vibrator", "none: no haptics driver" },
-		{ "Modem", "/sys/class/net/wwan0", "none: no modem driver" },
-		{ "Bluetooth", "/sys/class/bluetooth/hci0", "none" },
-		{ "Camera", "/dev/video0", "none" },
-		{ "Processor idle states", "/sys/devices/system/cpu/cpu0/cpuidle", "none: cores only wait for interrupts" },
+	static const struct { const char *what, *missing; } parts[] = {
+		{ "Display (DECON, DSI)", "no panel" },
+		{ "GPU (Mali-G72, Panfrost)", "no GPU" },
+		{ "Touch (s6sy761)", "no touch" },
+		{ "Wi-Fi (brcmfmac)", "no Wi-Fi interface" },
+		{ "Battery gauge (MAX77705)", "no gauge" },
+		{ "Sound card", "none: no codec or audio DSP driver" },
+		{ "Backlight device", "none: brightness is done by the shell" },
+		{ "Light and motion sensors", "none: no sensor hub driver" },
+		{ "Vibrator", "none: no haptics driver" },
+		{ "Modem", "none: no modem driver" },
+		{ "Bluetooth", "none" },
+		{ "Camera", "none" },
+		{ "Processor idle states", "none: cores only wait for interrupts" },
 	};
 	double y = zmc_header(cr, "hardware");
 	for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
-		y = zmc_field(cr, y, parts[i].what, exists(parts[i].path) ? "present" : parts[i].missing);
+		y = zmc_field(cr, y, parts[i].what, check_part(i) ? "present" : parts[i].missing);
 	}
 	return y + 10;
 }
