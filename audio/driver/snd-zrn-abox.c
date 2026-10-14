@@ -375,6 +375,8 @@ static void amp_write(u8 addr, u16 reg, u8 val)
 	u8 buf[3] = { reg >> 8, reg & 0xff, val };
 	struct i2c_msg msg = { .addr = addr, .len = 3, .buf = buf };
 
+	if (!amp_bus)
+		amp_bus = i2c_get_adapter(AMP_BUS);
 	if (amp_bus && i2c_transfer(amp_bus, &msg, 1) != 1)
 		pr_warn_ratelimited("snd-zrn-abox: amplifier %02x did not take %04x\n", addr, reg);
 }
@@ -845,9 +847,13 @@ static int __init abox_init(void)
 		ret = PTR_ERR(i2c_pdev);
 		goto err;
 	}
-	amp_bus = i2c_get_adapter(AMP_BUS);
+	for (i = 0; i < 20 && !amp_bus; i++) {
+		amp_bus = i2c_get_adapter(AMP_BUS);
+		if (!amp_bus)
+			msleep(10);
+	}
 	if (!amp_bus)
-		pr_warn("snd-zrn-abox: no amplifier bus (is i2c-gpio loaded?): there will be no sound\n");
+		pr_warn("snd-zrn-abox: no amplifier bus (is i2c-gpio loaded?): will retry on playback\n");
 
 	ret = snd_card_new(dev, SNDRV_DEFAULT_IDX1, "ZrnAbox", THIS_MODULE, 0, &card);
 	if (ret)

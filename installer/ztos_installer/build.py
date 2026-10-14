@@ -173,16 +173,20 @@ cp -a "$SRC/os/overlay-$TARGET/." "$R/"
 if [ "$TARGET" = starlte ]; then
 	cp -a "$SRC/rootfs/overlay/." "$R/"         # the phone's own: USB link, charger, fallbacks
 	install -Dm644 -t "$R/usr/lib/firmware/brcm" "$SRC"/firmware/bcmdhd* "$SRC"/firmware/nvram*
-	if compgen -G "$SRC/firmware/calliope_*.bin" > /dev/null; then
-		install -Dm644 -t "$R/usr/lib/firmware" "$SRC"/firmware/calliope_*.bin
-	fi
+	for f in "$SRC"/firmware/calliope_*.bin; do
+		[ -f "$f" ] && install -Dm644 -t "$R/usr/lib/firmware" "$f"
+	done
 	install -d "$R/usr/lib/modules/7.1.0-zboot/extra"
 	install -d "$R/usr/local/lib"
 	if [ -f "$SRC/modem/zrn-modem/zrn-modem.ko" ]; then
 		install -m644 "$SRC/modem/zrn-modem/zrn-modem.ko" "$R/usr/local/lib/zrn-modem.ko"
 		install -m644 "$SRC/modem/zrn-modem/zrn-modem.ko" "$R/usr/lib/modules/7.1.0-zboot/extra/"
+	elif [ -f "$SRC/prebuilts/modules/zrn-modem.ko" ]; then
+		install -m644 "$SRC/prebuilts/modules/zrn-modem.ko" "$R/usr/local/lib/zrn-modem.ko"
+		install -m644 "$SRC/prebuilts/modules/zrn-modem.ko" "$R/usr/lib/modules/7.1.0-zboot/extra/"
 	fi
-	for k in "$SRC"/power/idle/zrn-cpuidle.ko "$SRC"/haptics/zrn-haptic.ko \
+	for k in "$SRC"/prebuilts/modules/*.ko \
+	         "$SRC"/power/idle/zrn-cpuidle.ko "$SRC"/haptics/zrn-haptic.ko \
 	         "$SRC"/power/hotplug/zrn-hotplug.ko "$SRC"/leds/zrn-led.ko \
 	         "$SRC"/sensors/driver/zrn-bbd.ko "$SRC"/audio/driver/snd-zrn-abox.ko \
 	         "$SRC"/audio/modules/*.ko; do
@@ -198,7 +202,8 @@ if [ "$TARGET" = starlte ]; then
 		kver=$(basename "$moddir")
 		[ "$kver" = "7.1.0-zboot" ] && continue
 		install -d "$moddir/extra"
-		for k in "$SRC"/power/idle/zrn-cpuidle.ko "$SRC"/haptics/zrn-haptic.ko \
+		for k in "$SRC"/prebuilts/modules/*.ko \
+		         "$SRC"/power/idle/zrn-cpuidle.ko "$SRC"/haptics/zrn-haptic.ko \
 		         "$SRC"/power/hotplug/zrn-hotplug.ko "$SRC"/leds/zrn-led.ko \
 		         "$SRC"/sensors/driver/zrn-bbd.ko "$SRC"/audio/driver/snd-zrn-abox.ko \
 		         "$SRC"/audio/modules/*.ko; do

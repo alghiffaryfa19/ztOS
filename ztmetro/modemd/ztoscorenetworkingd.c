@@ -117,10 +117,13 @@ static void publish(void)
 		return;
 	int reg = now.eps_reg == 1 || now.eps_reg == 5 ? now.eps_reg :
 		now.cs_reg ? now.cs_reg : now.ps_reg;
+	int bars = now.bars;
+	if (bars <= 0 && (reg == 1 || reg == 5))
+		bars = 3;
 	fprintf(f, "call=%s\ncall_number=%s\n", now.call[0] ? now.call : "idle", now.call_number);
 	fprintf(f, "sim=%s\noperator=%s\nbars=%d\nregistered=%s\ntech=%s\nairplane=%d\ndata=%d\ndata_on=%d\n"
 		"ip=%s\nwifi_bars=%d\n",
-		now.sim, now.operator, now.bars, reg_name(reg), tech(),
+		now.sim, now.operator, bars, reg_name(reg), tech(),
 		/* (this modem's AT+CFUN? has been seen to say "off" while it is
 		 * registered: a registered radio is not in airplane mode) */
 		now.airplane && reg != 1 && reg != 5, now.data, now.data_on,
@@ -487,7 +490,25 @@ static void on_line(char *l)
 			strstr(s, "PUK") ? "puk" : strstr(s, "PIN") ? "pin" : "error");
 	} else if (!strncmp(l, "+CSQ:", 5)) {
 		int rssi = atoi(l + 5);
-		now.bars = csq_bars(rssi);
+		if (rssi >= 0 && rssi != 99) {
+			now.bars = csq_bars(rssi);
+		} else if (now.bars <= 0 && (now.eps_reg == 1 || now.eps_reg == 5 || now.cs_reg == 1 || now.cs_reg == 5)) {
+			now.bars = 3;
+		}
+	} else if (!strncmp(l, "+CESQ:", 6)) {
+		int rxlev = 99, ber = 99, rscp = 255, ecno = 255, rsrq = 255, rsrp = 255;
+		if (sscanf(l + 6, "%d,%d,%d,%d,%d,%d", &rxlev, &ber, &rscp, &ecno, &rsrq, &rsrp) >= 1) {
+			if (rsrp != 255 && rsrp >= 0) {
+				now.bars = rsrp >= 64 ? 5 : rsrp >= 52 ? 4 : rsrp >= 40 ? 3 : rsrp >= 28 ? 2 : rsrp >= 15 ? 1 : 0;
+			} else if (rscp != 255 && rscp >= 0) {
+				now.bars = rscp >= 60 ? 5 : rscp >= 48 ? 4 : rscp >= 36 ? 3 : rscp >= 24 ? 2 : rscp >= 10 ? 1 : 0;
+			} else if (rxlev != 99 && rxlev >= 0) {
+				now.bars = rxlev >= 45 ? 5 : rxlev >= 35 ? 4 : rxlev >= 25 ? 3 : rxlev >= 15 ? 2 : rxlev >= 5 ? 1 : 0;
+			}
+		}
+		if (now.bars <= 0 && (now.eps_reg == 1 || now.eps_reg == 5 || now.cs_reg == 1 || now.cs_reg == 5)) {
+			now.bars = 3;
+		}
 	} else if (!strncmp(l, "+COPS:", 6)) {
 		/* mode,format,"name",act */
 		char *q = strchr(l, '"'), *e = q ? strchr(q + 1, '"') : NULL;
@@ -950,6 +971,13 @@ static void ipc_message(int main_cmd, int sub, int type, const unsigned char *da
 			now.data = false;
 			now.ip[0] = 0;
 		}
+	} else if ((main_cmd == 0x07 && (sub == 0x01 || sub == 0x06)) ||
+		   (main_cmd == 0x09 && sub == 0x02) ||
+		   (main_cmd == 0x08 && (sub == 0x03 || sub == 0x04))) {
+		if (len >= 1 && data[0] <= 5 && data[0] > 0)
+			now.bars = data[0];
+		else if (len >= 1 && data[0] > 5)
+			now.bars = csq_bars(data[0]);
 	}
 }
 
@@ -1064,9 +1092,10 @@ static void ctl_readable(void)
 
 /* ---- Wi-Fi, for the shell ------------------------------------------------ */
 
+static int wifi_fail_count = 0;
 static void wifi_read(void)
 {
-	now.wifi_bars = -1;
+	int bars = -1;
 	char l[256];
 
 	/* 1. NetworkManager active Wi-Fi connection and signal percentage */
@@ -1075,36 +1104,55 @@ static void wifi_read(void)
 		if (fgets(l, sizeof(l), p)) {
 			int sig = 0;
 			if (sscanf(l, "*:%d", &sig) == 1) {
-				now.wifi_bars = sig >= 75 ? 3 : sig >= 50 ? 2 : sig >= 25 ? 1 : 0;
+				bars = sig >= 75 ? 3 : sig >= 50 ? 2 : sig >= 25 ? 1 : 0;
 			}
 		}
 		pclose(p);
 	}
-	if (now.wifi_bars >= 0)
-		return;
 
 	/* 2. iw dev ... link */
-	p = popen("for d in /sys/class/net/w*; do [ -d \"$d\" ] && iw dev ${d##*/} link 2>/dev/null; done", "r");
-	while (p && fgets(l, sizeof(l), p)) {
-		int dbm;
-		if (!strncmp(l, "Connected", 9) && now.wifi_bars < 0)
-			now.wifi_bars = 3;
-		if (sscanf(l, " signal: %d", &dbm) == 1)
-			now.wifi_bars = dbm >= -60 ? 3 : dbm >= -72 ? 2 : dbm >= -82 ? 1 : 0;
+	if (bars < 0) {
+		p = popen("for d in /sys/class/net/w*; do [ -d \"$d\" ] && iw dev ${d##*/} link 2>/dev/null; done", "r");
+		while (p && fgets(l, sizeof(l), p)) {
+			int dbm;
+			if (!strncmp(l, "Connected", 9) && bars < 0)
+				bars = 3;
+			if (sscanf(l, " signal: %d", &dbm) == 1)
+				bars = dbm >= -60 ? 3 : dbm >= -72 ? 2 : dbm >= -82 ? 1 : 0;
+		}
+		if (p)
+			pclose(p);
 	}
-	if (p)
-		pclose(p);
-	if (now.wifi_bars >= 0)
-		return;
 
-	/* 3. sysfs link carrier or operstate */
-	p = popen("for d in /sys/class/net/w*; do "
-		"[ \"$(cat $d/carrier 2>/dev/null)\" = 1 ] && echo up && break; "
-		"[ \"$(cat $d/operstate 2>/dev/null)\" = up ] && echo up && break; done", "r");
-	if (p) {
-		if (fgets(l, sizeof(l), p) && strncmp(l, "up", 2) == 0)
-			now.wifi_bars = 3;
-		pclose(p);
+	/* 3. NetworkManager active connection state */
+	if (bars < 0) {
+		p = popen("nmcli -t -f TYPE,STATE dev 2>/dev/null | grep -E '^wifi:connected|^wlan:connected'", "r");
+		if (p) {
+			if (fgets(l, sizeof(l), p))
+				bars = (now.wifi_bars >= 0) ? now.wifi_bars : 3;
+			pclose(p);
+		}
+	}
+
+	/* 4. sysfs link carrier or operstate */
+	if (bars < 0) {
+		p = popen("for d in /sys/class/net/w*; do "
+			"[ \"$(cat $d/carrier 2>/dev/null)\" = 1 ] && echo up && break; "
+			"[ \"$(cat $d/operstate 2>/dev/null)\" = up ] && echo up && break; done", "r");
+		if (p) {
+			if (fgets(l, sizeof(l), p) && strncmp(l, "up", 2) == 0)
+				bars = (now.wifi_bars >= 0) ? now.wifi_bars : 3;
+			pclose(p);
+		}
+	}
+
+	if (bars >= 0) {
+		wifi_fail_count = 0;
+		now.wifi_bars = bars;
+	} else {
+		/* Transient miss: require 3 consecutive misses (~30s) before reporting disconnected */
+		if (++wifi_fail_count >= 3)
+			now.wifi_bars = -1;
 	}
 }
 
@@ -1114,6 +1162,7 @@ static void poll_state(void)
 {
 	queue_at("AT+CPIN?");
 	queue_at("AT+CSQ");
+	queue_at("AT+CESQ");
 	queue_at("AT+COPS?");
 	queue_at("AT+CREG?");
 	queue_at("AT+CGREG?");

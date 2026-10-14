@@ -2808,6 +2808,10 @@ static bool wifi_up(void) {
  */
 static double text_width(const char *text, const char *font, double size);
 
+static bool cell_registered(struct zt_server *server) {
+	return strcmp(server->cell_reg, "home") == 0 || strcmp(server->cell_reg, "roaming") == 0;
+}
+
 /* What ztoscorenetworkingd last wrote about the modem (and the Wi-Fi link): a small
  * file of key=value lines, read when it says so on the control pipe and with
  * the clock. Nothing here waits on a program. */
@@ -2852,13 +2856,22 @@ static void modem_read(struct zt_server *server) {
 		fclose(f);
 	}
 	if (wifi > -2) {
-		server->wifi_bars = wifi;
-		server->wifi_read_ms = now_ms();
+		if (wifi >= 0) {
+			server->wifi_bars = wifi;
+			server->wifi_read_ms = now_ms();
+		} else if (server->wifi_bars >= 0 && wifi_up()) {
+			if (now_ms() - server->wifi_read_ms > 25000) {
+				server->wifi_bars = -1;
+				server->wifi_read_ms = now_ms();
+			}
+		} else {
+			server->wifi_bars = -1;
+			server->wifi_read_ms = now_ms();
+		}
 	}
-}
-
-static bool cell_registered(struct zt_server *server) {
-	return strcmp(server->cell_reg, "home") == 0 || strcmp(server->cell_reg, "roaming") == 0;
+	if (cell_registered(server) && server->cell_bars <= 0) {
+		server->cell_bars = 3;
+	}
 }
 
 /* Five bars, `lit` of them white and the rest faint. */
