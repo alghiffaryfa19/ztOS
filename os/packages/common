@@ -12,6 +12,10 @@ openssh
 xdg-user-dirs
 alsa-utils
 brightnessctl
+pipewire
+pipewire-pulse
+pipewire-alsa
+wireplumber
 
 # the session: greetd starts ztMETRO, the only shell ztOS has
 greetd

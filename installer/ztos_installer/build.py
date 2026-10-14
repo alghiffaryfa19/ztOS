@@ -25,6 +25,7 @@ WORK = ROOT / "build" / "ztos"
 TARBALL = ROOT / "build" / "alarm.tar.gz"
 TARBALL_URL = "http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
 SDK = ROOT / "sdk"
+PKGCACHE = ROOT / "build" / "pkg-cache"
 EDK2 = Path("/usr/share/edk2/aarch64")
 
 
@@ -134,6 +135,8 @@ mount --bind "$R" "$R"
 mount --rbind /dev "$R/dev"
 mount -t proc proc "$R/proc"
 mount -t tmpfs tmpfs "$R/tmp"
+mkdir -p "$PKGCACHE" "$R/var/cache/pacman/pkg"
+mount --bind "$PKGCACHE" "$R/var/cache/pacman/pkg"
 rm -f "$R/etc/resolv.conf"; cp -L /etc/resolv.conf "$R/etc/resolv.conf"
 ch() { chroot "$R" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/bin HOME=/root LANG=C.UTF-8 "$@"; }
 P="pacman --disable-sandbox --noconfirm"
@@ -169,7 +172,10 @@ cp -a "$SRC/os/overlay/." "$R/"
 cp -a "$SRC/os/overlay-$TARGET/." "$R/"
 if [ "$TARGET" = starlte ]; then
 	cp -a "$SRC/rootfs/overlay/." "$R/"         # the phone's own: USB link, charger, fallbacks
-	install -Dm644 -t "$R/usr/lib/firmware/brcm" "$SRC"/firmware/*
+	install -Dm644 -t "$R/usr/lib/firmware/brcm" "$SRC"/firmware/bcmdhd* "$SRC"/firmware/nvram*
+	if compgen -G "$SRC/firmware/calliope_*.bin" > /dev/null; then
+		install -Dm644 -t "$R/usr/lib/firmware" "$SRC"/firmware/calliope_*.bin
+	fi
 	install -d "$R/usr/lib/modules/7.1.0-zboot/extra"
 	install -d "$R/usr/local/lib"
 	if [ -f "$SRC/modem/zrn-modem/zrn-modem.ko" ]; then
@@ -284,13 +290,13 @@ FSTAB
 fi
 
 step "tidying up"
-ch pacman -Scc --noconfirm > /dev/null 2>&1 || true
 rm -f "$R/etc/resolv.conf"; ln -sf /run/systemd/resolve/stub-resolv.conf "$R/etc/resolv.conf"
 rm -rf "$R/tmp/"* "$R/var/log/pacman.log"
 echo ztos > "$R/etc/ztos/built"
 date -u +%Y-%m-%dT%H:%MZ >> "$R/etc/ztos/built"
 
 step "writing the system image"
+umount -l "$R/var/cache/pacman/pkg" 2>/dev/null || true
 umount -l "$R/tmp" "$R/proc" 2>/dev/null || true
 umount -lR "$R/dev" 2>/dev/null || true
 umount -l "$R" 2>/dev/null || true
@@ -312,6 +318,7 @@ def run_stage(s: Settings, log: Path) -> None:
         "PASSWORD": s.password, "HOSTNAME": s.hostname, "TIMEZONE": s.timezone, "FRESH": "1" if s.fresh else "0",
         "ROOTIMG": str(s.dir / "root.img"), "SIZE": str(s.size_gb), "MKE2FS": mke2fs,
         "LABEL": "ZR_ARCH" if s.target == "starlte" else "ztos-root",
+        "PKGCACHE": str(PKGCACHE),
         "PATH": os.environ.get("PATH", "/usr/bin"),
     }
     script = s.dir / "stage.sh"
