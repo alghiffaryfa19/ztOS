@@ -13,9 +13,8 @@ from pathlib import Path
 from .build import EDK2, ROOT, WORK, Fail, say
 
 
-MANUAL_REBOOT = """If the phone does not restart by itself:
-  - hold Power for about 10 seconds to force a reboot, or
-  - hold Power + Volume Down until it powers off, then Power to start it again."""
+MANUAL_REBOOT = """To reboot the phone:
+  - hold Power and Volume+, Volume- keys to reboot."""
 
 
 def ping_phone() -> bool:
@@ -157,8 +156,8 @@ Steps (the installer does 3 to 6 for you, and asks before each)
   5. The boot image is written to BOOT, and read back to check it.
   6. The system is written to USERDATA in 256 MiB pieces, each checked; a cut
      cable just means running it again: it carries on.
-  7. Reboot. The first start takes a minute: the system grows to fill the
-     storage, then the Welcome app shows how ztOS is used.
+  7. Reboot: hold Power and Volume+, Volume- keys to reboot. The first start takes a minute:
+     the system grows to fill the storage, then the Welcome app shows how ztOS is used.
 
 If anything goes wrong, the phone comes back to TWRP by itself; run the
 installer again from step 2.
@@ -207,15 +206,11 @@ def install_phone(root_image: Path, ask) -> None:
             break
     time.sleep(2)
     subprocess.run([str(ROOT / "scripts" / "flash-root.sh"), str(root_image)], check=True)
-    if ask("Restart the phone into ztOS now?"):
-        try:
-            r = subprocess.run([sys.executable, str(ROOT / "scripts" / "psh.py"), "reboot"],
-                               capture_output=True, timeout=90)
-            if r.returncode != 0:
-                raise RuntimeError((r.stderr or r.stdout or b"too slow").decode(errors="replace").strip()[:200])
-        except Exception as e:
-            say("")
-            say("FAILED TO REBOOT: the phone was told, but did not answer.")
-            say(f"  ({e})")
-            print(MANUAL_REBOOT)
+    try:
+        subprocess.run([sys.executable, str(ROOT / "scripts" / "psh.py"), "-t", "5", "reboot"],
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
+    say("")
+    say("Hold Power and Volume+, Volume- keys to reboot.")
     say("done: ztOS starts on the phone (the first start takes a minute)")
