@@ -3165,28 +3165,28 @@ static void status_row(struct zt_server *server, cairo_t *cr, bool details, bool
 			cairo_stroke(cr);
 		}
 
-		/* The charge: Windows Phone warning red below 15%, solid white otherwise */
+		/* The charge: Windows Phone warning red below 15%, solid white otherwise.
+		 * In authentic WP8.1 charging mode, the battery frame holds the centered
+		 * plug cleanly (plus the red bar if low); it does not paint a white bar
+		 * sliced by an artificial black cutout box. */
 		double inset = line + gap;
 		double max_fill_w = bw - 2 * inset;
 		double fill_w = max_fill_w * battery / 100.0;
-		if (battery <= 15)
+		if (battery <= 15) {
 			cairo_set_source_rgb(cr, 0.898, 0.078, 0.0);
-		else
+			if (fill_w > 0) {
+				cairo_rectangle(cr, bx + inset, y_top + inset, fill_w, cell - 2 * inset);
+				cairo_fill(cr);
+			}
+		} else if (!server->charging) {
 			cairo_set_source_rgb(cr, 1, 1, 1);
-		if (fill_w > 0) {
-			cairo_rectangle(cr, bx + inset, y_top + inset, fill_w, cell - 2 * inset);
-			cairo_fill(cr);
+			if (fill_w > 0) {
+				cairo_rectangle(cr, bx + inset, y_top + inset, fill_w, cell - 2 * inset);
+				cairo_fill(cr);
+			}
 		}
 
 		if (server->charging) {
-			/* If charge reaches into plug region, mask it out so plug stands clear */
-			double plug_mask_l = cx - pw / 2.0 - gap;
-			double plug_mask_r = cx + pw / 2.0 + gap;
-			if (bx + inset + fill_w > plug_mask_l) {
-				cairo_set_source_rgb(cr, 0, 0, 0);
-				cairo_rectangle(cr, plug_mask_l, y_top + inset, plug_mask_r - plug_mask_l, cell - 2 * inset);
-				cairo_fill(cr);
-			}
 
 			server->battery_full = battery >= 100;
 			int pw_i = (int)ceil(pw) + 4;
