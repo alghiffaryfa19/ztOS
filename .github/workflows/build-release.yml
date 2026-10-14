@@ -1,0 +1,105 @@
+name: Build and Release ztOS
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build ztOS Images & Publish Release
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            dosfstools \
+            e2fsprogs \
+            flex \
+            libarchive-tools \
+            libelf-dev \
+            libssl-dev \
+            mtools \
+            qemu-user-static \
+            binfmt-support \
+            util-linux \
+            xz-utils \
+            zstd \
+            curl \
+            python3
+
+      - name: Set up QEMU ARM64 binfmt
+        run: |
+          sudo systemctl restart systemd-binfmt.service || true
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64 || true
+
+      - name: Build ztOS starlte system image
+        run: |
+          python3 installer/ztos build --target starlte --user ztos --password ztos --hostname ztos --timezone UTC
+
+      - name: Build ztOS boot image (Samsung Galaxy S9)
+        run: |
+          ./scripts/build-boot.sh ztos-boot --fallback recovery --power --touch --cpufreq --gpu --decon --wlan
+
+      - name: Compress and package release assets
+        run: |
+          mkdir -p release-assets
+          cp out/ztos-boot.img release-assets/ztos-boot.img
+
+          echo "Compressing starlte root.img..."
+          zstd -T0 -15 build/ztos/starlte/root.img -o release-assets/ztos-starlte-root.img.zst
+          xz -T0 -9 -k build/ztos/starlte/root.img
+          mv build/ztos/starlte/root.img.xz release-assets/ztos-starlte-root.img.xz
+
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cd ..
+
+      - name: Determine tag name
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: ztOS ${{ steps.vars.outputs.tag }}
+          body: |
+            ## ztOS Release ${{ steps.vars.outputs.tag }}
+            
+            Prebuilt flashable system and boot images for ztOS on Samsung Galaxy S9 (starlte).
+            
+            ### Included Files:
+            - **`ztos-boot.img`**: Mainline 7.1 Linux kernel boot image for `BOOT` partition.
+            - **`ztos-starlte-root.img.zst` / `.xz`**: Full 10 GB Arch Linux ARM rootfs with ztMETRO shell and apps.
+            - **`SHA256SUMS.txt`**: Verification checksums.
+            
+            ### Quick Install via ztOS Installer:
+            Run `installer/ztos install --target starlte` and select **Option 1: Auto Download Prebuilt image and install**.
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

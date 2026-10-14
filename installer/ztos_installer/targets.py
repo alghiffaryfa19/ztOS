@@ -150,8 +150,8 @@ def install_phone(root_image: Path, ask) -> None:
     if input("Type ERASE to go on: ").strip() != "ERASE":
         raise Fail("stopped: the boot image is written, the user data is untouched (Android will not start "
                    "until ztOS is installed or the stock BOOT image is written back)")
-    say("clearing old filesystem header from USERDATA...")
-    subprocess.run(["adb", "shell", "dd if=/dev/zero of=/dev/block/sda25 bs=1M count=10 conv=fsync"], check=True)
+    say("clearing old/partial filesystem header from USERDATA...")
+    subprocess.run(["adb", "shell", "dd if=/dev/zero of=/dev/block/sda25 bs=1M count=20 conv=fsync"], check=True)
     say("rebooting phone into ztOS rescue shell...")
     subprocess.run(["adb", "reboot"], check=True)
     say("waiting for the phone to start its rescue shell on USB (172.16.42.1)...")

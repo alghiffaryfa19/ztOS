@@ -36,6 +36,7 @@ echo "image $IMG: $SIZE bytes, $N chunks of ${CHUNK}M -> $PART"
 psize=$("$PSH" -t 20 "blockdev --getsize64 $PART" | tr -dc 0-9)
 [ -n "$psize" ] && [ "$psize" -ge "$SIZE" ] ||
 	{ echo "partition too small or unreachable ($psize)" >&2; exit 1; }
+"$PSH" -t 10 "touch /run/zboot.hold" >/dev/null 2>&1 || true
 
 # sha256 of one chunk of the partition, as the phone reads it
 part_hash() {
