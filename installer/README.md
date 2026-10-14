@@ -5,12 +5,20 @@ its own apps, an updater and the ztOS SDK. `ztos` builds it and installs it,
 either into an emulator on your computer or onto a Samsung Galaxy S9.
 
 ```
-installer/ztos                      the guided installer: it asks where, and who you are
-installer/ztos install --target qemu      try ztOS in the emulator
+installer/ztos                      the guided installer (asks for mode, target, and user)
+installer/ztos install --mode download       auto-download prebuilt release images and install
+installer/ztos install --mode build-install  build locally and install immediately
+installer/ztos install --mode build-store    build locally and store image for later
 installer/ztos emulator             start the emulator again later
 installer/ztos guide                how installing on the phone goes, step by step
 installer/ztos doctor               is this computer ready?
 ```
+
+> **Prebuilt Release Images:**
+> Official prebuilt images automatically downloaded from GitHub Releases come with:
+> - **Username:** `zerone`
+> - **Password:** `toor` (has full `sudo` privileges)
+
 
 ## What you need
 

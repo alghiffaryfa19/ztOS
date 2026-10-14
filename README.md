@@ -10,6 +10,10 @@ S9 (starlte) and in the QEMU emulator.
 >Your warranty is now void. I am not responsible for bricked devices, dead SD cards, thermonuclear war, or you getting fired because the alarm app failed. Please do some research if you have any concerns about features included in this ROM before flashing it! YOU are choosing to make these modifications, and if you point the finger at me for messing up your device, I will laugh at you.
 
 **To install it:** `installer/ztos` (see [installer/README.md](installer/README.md)).
+The installer lets you choose between:
+1. **Auto Download Prebuilt image and install** (fastest, uses GitHub Release images with default login `zerone` / `toor`)
+2. **Build image in this PC and install** (custom user/password, builds via QEMU user emulation)
+3. **Build image in this PC and store** (builds and exports the image without flashing)
 
 **Jump to:** [Screenshots](#screenshots) · [Status: what works](#status) · [**Known quirks**](#known-quirks) (read before flashing) · [What is where](#what-is-where) · [The SDK](sdk/README.md) · [License](#license)
 

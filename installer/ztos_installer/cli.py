@@ -104,14 +104,68 @@ def wizard(args) -> b.Settings:
 
 
 def cmd_install(args):
+    mode = getattr(args, "mode", None)
+    if not mode and not args.yes:
+        print(BANNER)
+        print("Welcome to the ztOS Installer!\n")
+        print("Choose an option:")
+        print("  1. Auto Download Prebuilt image and install (fastest, no compiling)")
+        print("  2. Build image in this PC and install")
+        print("  3. Build image in this PC and store")
+        choice = prompt("1, 2 or 3", "1", lambda a: None if a in ("1", "2", "3") else "choose 1, 2 or 3")
+        mode = {"1": "download", "2": "build-install", "3": "build-store"}[choice]
+    else:
+        mode = mode or "build-install"
+
+    if mode == "download":
+        if args.target:
+            target = args.target
+        else:
+            print("\nWhere should ztOS go?")
+            print("  1. the emulator (QEMU) on this computer: try it, nothing else is touched")
+            print("  2. a Samsung Galaxy S9 (starlte): replaces Android, erases the phone's data")
+            target = {"1": "qemu", "2": "starlte"}[prompt("1 or 2", "1", lambda a: None if a in ("1", "2") else "1 or 2")]
+        if target == "starlte":
+            print(t.PHONE_GUIDE)
+            if not ask("Go on?", default=False):
+                sys.exit(0)
+        from . import download
+        try:
+            image, boot = download.get_prebuilt(target)
+        except b.Fail as e:
+            print(f"\nztos: {e}")
+            if ask("Would you like to build on this PC instead?"):
+                mode = "build-install"
+            else:
+                sys.exit(1)
+        if mode == "download":
+            print("\nPrebuilt images use default credentials:")
+            print("  Username: zerone")
+            print("  Password: toor\n")
+            if target == "qemu":
+                print("ztOS is ready in the emulator disk:", image)
+                if args.yes or ask("Start it now?"):
+                    t.run_qemu(headless=args.headless, gl=getattr(args, "gl", False))
+                else:
+                    print("Start it later with: installer/ztos emulator")
+            else:
+                t.install_phone(image, ask)
+            return
+
     s = wizard(args)
     image = b.build(s)
+    if mode == "build-store":
+        print(f"\nztOS system image successfully built and stored at:\n  {image}\n")
+        print(f"You can install it anytime using:")
+        print(f"  installer/ztos install --target {s.target}")
+        return
+
     if s.target == "qemu":
         print("\nztOS is installed in the emulator's disk:", image)
         if args.yes or ask("Start it now?"):
             t.run_qemu(headless=args.headless, gl=getattr(args, "gl", False))
         else:
-            print("Start it later with: ztos emulator")
+            print("Start it later with: installer/ztos emulator")
     else:
         t.install_phone(image, ask)
 
@@ -162,6 +216,7 @@ def main(argv=None):
 
     p = sub.add_parser("install", help="the guided installer")
     with_settings(p)
+    p.add_argument("--mode", choices=["download", "build-install", "build-store"], help="installer mode")
     p.add_argument("--yes", action="store_true", help="no questions where there are answers")
     p.add_argument("--headless", action="store_true", help="the emulator without a window (vnc 127.0.0.1:5905)")
     p.set_defaults(func=cmd_install)

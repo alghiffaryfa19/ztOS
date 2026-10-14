@@ -52,24 +52,34 @@ jobs:
           sudo systemctl restart systemd-binfmt.service || true
           cat /proc/sys/fs/binfmt_misc/qemu-aarch64 || true
 
-      - name: Build ztOS starlte system image
+      - name: Build ztOS for Samsung Galaxy S9 (starlte)
         run: |
-          python3 installer/ztos build --target starlte --user ztos --password ztos --hostname ztos --timezone UTC
-
-      - name: Build ztOS boot image (Samsung Galaxy S9)
-        run: |
+          echo "=== Building S9 (starlte) rootfs ==="
+          python3 installer/ztos build --target starlte --user zerone --password toor --hostname ztos --timezone UTC
+          echo "=== Building S9 (starlte) boot image ==="
           ./scripts/build-boot.sh ztos-boot --fallback recovery --power --touch --cpufreq --gpu --decon --wlan
 
-      - name: Compress and package release assets
+      - name: Build ztOS for QEMU Emulator (qemu)
+        run: |
+          echo "=== Building QEMU disk image ==="
+          python3 installer/ztos build --target qemu --user zerone --password toor --hostname ztos --timezone UTC
+
+      - name: Package and compress release assets
         run: |
           mkdir -p release-assets
-          cp out/ztos-boot.img release-assets/ztos-boot.img
 
-          echo "Compressing starlte root.img..."
+          echo "=== Packaging S9 (starlte) ==="
+          cp out/ztos-boot.img release-assets/ztos-starlte-boot.img
           zstd -T0 -15 build/ztos/starlte/root.img -o release-assets/ztos-starlte-root.img.zst
           xz -T0 -9 -k build/ztos/starlte/root.img
           mv build/ztos/starlte/root.img.xz release-assets/ztos-starlte-root.img.xz
 
+          echo "=== Packaging QEMU Emulator ==="
+          zstd -T0 -15 build/ztos/qemu/ztos-qemu.img -o release-assets/ztos-qemu.img.zst
+          xz -T0 -9 -k build/ztos/qemu/ztos-qemu.img
+          mv build/ztos/qemu/ztos-qemu.img.xz release-assets/ztos-qemu.img.xz
+
+          echo "=== Calculating SHA256 checksums ==="
           cd release-assets
           sha256sum * > SHA256SUMS.txt
           cd ..
@@ -91,15 +101,31 @@ jobs:
           body: |
             ## ztOS Release ${{ steps.vars.outputs.tag }}
             
-            Prebuilt flashable system and boot images for ztOS on Samsung Galaxy S9 (starlte).
+            Official prebuilt system and boot images for ztOS Mobile.
             
-            ### Included Files:
-            - **`ztos-boot.img`**: Mainline 7.1 Linux kernel boot image for `BOOT` partition.
-            - **`ztos-starlte-root.img.zst` / `.xz`**: Full 10 GB Arch Linux ARM rootfs with ztMETRO shell and apps.
-            - **`SHA256SUMS.txt`**: Verification checksums.
+            ### Default Credentials:
+            * **Username:** `zerone`
+            * **Password:** `toor`
+            * **Sudo:** `zerone` has full sudo privileges (`toor`).
             
-            ### Quick Install via ztOS Installer:
-            Run `installer/ztos install --target starlte` and select **Option 1: Auto Download Prebuilt image and install**.
+            ---
+            
+            ### Included Packages & Separate Target Images:
+            
+            #### 1. Samsung Galaxy S9 (starlte)
+            * **`ztos-starlte-boot.img`**: Mainline 7.1 Linux kernel boot image for `BOOT` partition.
+            * **`ztos-starlte-root.img.zst` / `.xz`**: Full 10 GB Arch Linux ARM rootfs with ztMETRO shell and native apps.
+            
+            #### 2. QEMU PC Emulator (ARM64 virt)
+            * **`ztos-qemu.img.zst` / `.xz`**: Preconfigured GPT disk image with EFI bootloader, ready to boot via `installer/ztos emulator`.
+            
+            #### Checksums:
+            * **`SHA256SUMS.txt`**: Verification hashes for all assets.
+            
+            ---
+            
+            ### Quick Installation:
+            Run `installer/ztos install` and choose **1. Auto Download Prebuilt image and install**.
           files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
