@@ -73,7 +73,7 @@ EOS
 
 echo "=== image ==="
 rm -f "$ROOT/out/arch-root.img"
-fakeroot -i "$STATE" -- /usr/bin/mke2fs -q -t ext4 -L ZR_ARCH -m 1 -d "$R" "$ROOT/out/arch-root.img" "$SIZE"
+fakeroot -i "$STATE" -- /usr/bin/mke2fs -q -t ext4 -L ZR_ARCH -m 1 -O ^orphan_file -d "$R" "$ROOT/out/arch-root.img" "$SIZE"
 /usr/bin/e2fsck -fn "$ROOT/out/arch-root.img" | tail -n 2
 ls -ls "$ROOT/out/arch-root.img"
 echo "ARCH_ROOT_OK $ROOT/out/arch-root.img"

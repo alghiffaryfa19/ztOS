@@ -2,14 +2,16 @@ name: Build and Release ztOS
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release Tag (e.g. v0.1.0)'
-        required: true
-        default: 'v0.1.0'
+        description: 'Release Tag (leave empty to use VERSION file)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -47,6 +49,13 @@ jobs:
             curl \
             python3
 
+      - name: Configure namespaces and mount propagation
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo mount --make-rprivate /
+          sudo usermod --add-subuids 100000-165535 runner || true
+          sudo usermod --add-subgids 100000-165535 runner || true
+
       - name: Set up QEMU ARM64 binfmt
         run: |
           sudo systemctl restart systemd-binfmt.service || true
@@ -55,42 +64,57 @@ jobs:
       - name: Build ztOS for Samsung Galaxy S9 (starlte)
         run: |
           echo "=== Building S9 (starlte) rootfs ==="
-          python3 installer/ztos build --target starlte --user zerone --password toor --hostname ztos --timezone UTC
-          echo "=== Building S9 (starlte) boot image ==="
-          ./scripts/build-boot.sh ztos-boot --fallback recovery --power --touch --cpufreq --gpu --decon --wlan
+          sudo python3 installer/ztos build --target starlte --user zerone --password toor --hostname ztos --timezone UTC
 
       - name: Build ztOS for QEMU Emulator (qemu)
         run: |
           echo "=== Building QEMU disk image ==="
-          python3 installer/ztos build --target qemu --user zerone --password toor --hostname ztos --timezone UTC
+          sudo python3 installer/ztos build --target qemu --user zerone --password toor --hostname ztos --timezone UTC
 
       - name: Package and compress release assets
         run: |
           mkdir -p release-assets
 
           echo "=== Packaging S9 (starlte) ==="
-          cp out/ztos-boot.img release-assets/ztos-starlte-boot.img
-          zstd -T0 -15 build/ztos/starlte/root.img -o release-assets/ztos-starlte-root.img.zst
-          xz -T0 -9 -k build/ztos/starlte/root.img
-          mv build/ztos/starlte/root.img.xz release-assets/ztos-starlte-root.img.xz
+          if [ -f prebuilts/boot/ztos-starlte-boot.img ]; then
+            cp prebuilts/boot/ztos-starlte-boot.img release-assets/ztos-starlte-boot.img
+          elif [ -f out/ztos-boot.img ]; then
+            cp out/ztos-boot.img release-assets/ztos-starlte-boot.img
+          fi
+          sudo zstd -T0 -15 build/ztos/starlte/root.img -o release-assets/ztos-starlte-root.img.zst
+          sudo xz -T0 -9 -k build/ztos/starlte/root.img
+          sudo mv build/ztos/starlte/root.img.xz release-assets/ztos-starlte-root.img.xz
 
           echo "=== Packaging QEMU Emulator ==="
-          zstd -T0 -15 build/ztos/qemu/ztos-qemu.img -o release-assets/ztos-qemu.img.zst
-          xz -T0 -9 -k build/ztos/qemu/ztos-qemu.img
-          mv build/ztos/qemu/ztos-qemu.img.xz release-assets/ztos-qemu.img.xz
+          sudo zstd -T0 -15 build/ztos/qemu/ztos-qemu.img -o release-assets/ztos-qemu.img.zst
+          sudo xz -T0 -9 -k build/ztos/qemu/ztos-qemu.img
+          sudo mv build/ztos/qemu/ztos-qemu.img.xz release-assets/ztos-qemu.img.xz
 
           echo "=== Calculating SHA256 checksums ==="
           cd release-assets
           sha256sum * > SHA256SUMS.txt
           cd ..
 
-      - name: Determine tag name
+      - name: Determine tag name and ensure tag exists
         id: vars
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+          VER=$(cat VERSION | tr -d '[:space:]')
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
           else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+            TAG="v$VER"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Using release tag: $TAG"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Creating and pushing tag $TAG..."
+            git tag "$TAG"
+            git push origin "$TAG" || true
           fi
 
       - name: Create GitHub Release and Upload Assets
@@ -114,7 +138,7 @@ jobs:
             
             #### 1. Samsung Galaxy S9 (starlte)
             * **`ztos-starlte-boot.img`**: Mainline 7.1 Linux kernel boot image for `BOOT` partition.
-            * **`ztos-starlte-root.img.zst` / `.xz`**: Full 10 GB Arch Linux ARM rootfs with ztMETRO shell and native apps.
+            * **`ztos-starlte-root.img.zst` / `.xz`**: Full 10 GB Arch Linux ARM rootfs with ztMETRO shell, drivers and native apps.
             
             #### 2. QEMU PC Emulator (ARM64 virt)
             * **`ztos-qemu.img.zst` / `.xz`**: Preconfigured GPT disk image with EFI bootloader, ready to boot via `installer/ztos emulator`.

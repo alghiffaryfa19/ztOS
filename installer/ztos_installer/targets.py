@@ -4,11 +4,56 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 from .build import EDK2, ROOT, WORK, Fail, say
+
+
+MANUAL_REBOOT = """If the phone does not restart by itself:
+  - hold Power for about 10 seconds to force a reboot, or
+  - hold Power + Volume Down until it powers off, then Power to start it again."""
+
+
+def ping_phone() -> bool:
+    r = subprocess.run(["ping", "-c", "1", "-W", "1", "172.16.42.1"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return r.returncode == 0
+
+
+def reboot_from_rescue() -> None:
+    """Restart a phone that is sitting in the ztOS Rescue shell (telnet on USB),
+    into ztOS. Never raises: the rescue shell may already be gone, and the
+    buttons always work."""
+    if not ping_phone():
+        say("no phone answers on USB (172.16.42.1)")
+        say("is it in ztOS Rescue? (It gets there on its own if a start fails twice.)")
+        print(MANUAL_REBOOT)
+        return
+    try:    # Rescue answers telnet on port 23; running ztOS does not
+        socket.create_connection(("172.16.42.1", 23), timeout=5).close()
+    except OSError:
+        say("the phone answers, but it is not in ztOS Rescue (no rescue shell)")
+        say("if it is running ztOS already, there is nothing to do; otherwise:")
+        print(MANUAL_REBOOT)
+        return
+    say("rebooting the phone from ztOS Rescue...")
+    try:
+        subprocess.run([sys.executable, str(ROOT / "scripts" / "psh.py"), "reboot"],
+                       check=False, timeout=60)
+    except Exception as e:            # the rescue shell went away mid-command: fine
+        say(f"(the rescue shell did not answer: {e})")
+    for _ in range(60):
+        if not ping_phone():
+            say("the phone has left the rescue shell: it is starting ztOS "
+                "(the first start takes a minute)")
+            return
+        time.sleep(1)
+    print(MANUAL_REBOOT)
+
 
 # --- QEMU ----------------------------------------------------------------------
 
@@ -163,5 +208,14 @@ def install_phone(root_image: Path, ask) -> None:
     time.sleep(2)
     subprocess.run([str(ROOT / "scripts" / "flash-root.sh"), str(root_image)], check=True)
     if ask("Restart the phone into ztOS now?"):
-        subprocess.run([sys.executable, str(ROOT / "scripts" / "psh.py"), "reboot"], check=False)
+        try:
+            r = subprocess.run([sys.executable, str(ROOT / "scripts" / "psh.py"), "reboot"],
+                               capture_output=True, timeout=90)
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout or b"too slow").decode(errors="replace").strip()[:200])
+        except Exception as e:
+            say("")
+            say("FAILED TO REBOOT: the phone was told, but did not answer.")
+            say(f"  ({e})")
+            print(MANUAL_REBOOT)
     say("done: ztOS starts on the phone (the first start takes a minute)")

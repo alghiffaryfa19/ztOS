@@ -75,7 +75,7 @@ def check_host():
         missing.append("qemu-user-static + qemu-user-static-binfmt (to run aarch64 programs)")
     user = os.environ.get("USER", "")
     subuid = Path("/etc/subuid").read_text() if Path("/etc/subuid").exists() else ""
-    if not re.search(rf"^{re.escape(user)}:", subuid, re.M):
+    if os.geteuid() != 0 and not re.search(rf"^{re.escape(user)}:", subuid, re.M):
         missing.append(f"a /etc/subuid range for {user} (usermod --add-subuids 100000-165535 {user})")
     if missing:
         raise Fail("this computer is missing what building ztOS needs:\n  " + "\n  ".join(missing) +
@@ -170,17 +170,37 @@ cp -a "$SRC/os/overlay-$TARGET/." "$R/"
 if [ "$TARGET" = starlte ]; then
 	cp -a "$SRC/rootfs/overlay/." "$R/"         # the phone's own: USB link, charger, fallbacks
 	install -Dm644 -t "$R/usr/lib/firmware/brcm" "$SRC"/firmware/*
+	install -d "$R/usr/lib/modules/7.1.0-zboot/extra"
+	install -d "$R/usr/local/lib"
+	if [ -f "$SRC/modem/zrn-modem/zrn-modem.ko" ]; then
+		install -m644 "$SRC/modem/zrn-modem/zrn-modem.ko" "$R/usr/local/lib/zrn-modem.ko"
+		install -m644 "$SRC/modem/zrn-modem/zrn-modem.ko" "$R/usr/lib/modules/7.1.0-zboot/extra/"
+	fi
+	for k in "$SRC"/power/idle/zrn-cpuidle.ko "$SRC"/haptics/zrn-haptic.ko \
+	         "$SRC"/power/hotplug/zrn-hotplug.ko "$SRC"/leds/zrn-led.ko \
+	         "$SRC"/sensors/driver/zrn-bbd.ko "$SRC"/audio/driver/snd-zrn-abox.ko \
+	         "$SRC"/audio/modules/*.ko; do
+		[ -f "$k" ] && install -m644 "$k" "$R/usr/lib/modules/7.1.0-zboot/extra/"
+	done
+	if [ -f "$SRC/build/linux-7.1/out/modules.builtin" ]; then
+		install -m644 "$SRC/build/linux-7.1/out/modules.builtin" "$R/usr/lib/modules/7.1.0-zboot/"
+		install -m644 "$SRC/build/linux-7.1/out/modules.builtin.modinfo" "$R/usr/lib/modules/7.1.0-zboot/"
+	fi
+	ch depmod -a 7.1.0-zboot > /dev/null 2>&1 || true
 	for moddir in "$R"/usr/lib/modules/*; do
 		[ -d "$moddir" ] || continue
 		kver=$(basename "$moddir")
+		[ "$kver" = "7.1.0-zboot" ] && continue
 		install -d "$moddir/extra"
 		for k in "$SRC"/power/idle/zrn-cpuidle.ko "$SRC"/haptics/zrn-haptic.ko \
 		         "$SRC"/power/hotplug/zrn-hotplug.ko "$SRC"/leds/zrn-led.ko \
-		         "$SRC"/sensors/driver/zrn-bbd.ko "$SRC"/audio/driver/snd-zrn-abox.ko; do
+		         "$SRC"/sensors/driver/zrn-bbd.ko "$SRC"/audio/driver/snd-zrn-abox.ko \
+		         "$SRC"/audio/modules/*.ko; do
 			[ -f "$k" ] && install -m644 "$k" "$moddir/extra/"
 		done
 		ch depmod -a "$kver" > /dev/null 2>&1 || true
 	done
+	chmod 755 "$R"/usr/local/sbin/* 2>/dev/null || true
 fi
 install -d "$R/usr/local/share/fonts/selawik"
 install -m644 "$SRC"/os/fonts/selawik/*.ttf "$R/usr/local/share/fonts/selawik/"
@@ -275,7 +295,7 @@ umount -l "$R/tmp" "$R/proc" 2>/dev/null || true
 umount -lR "$R/dev" 2>/dev/null || true
 umount -l "$R" 2>/dev/null || true
 rm -f "$ROOTIMG"
-"$MKE2FS" -q -t ext4 -L "$LABEL" -m 1 -d "$R" "$ROOTIMG" "${SIZE}G"
+"$MKE2FS" -q -t ext4 -L "$LABEL" -m 1 -O ^orphan_file -d "$R" "$ROOTIMG" "${SIZE}G"
 echo STAGE-OK
 '''
 
@@ -301,9 +321,11 @@ def run_stage(s: Settings, log: Path) -> None:
     pkg_idx = 0
     in_progress = False
     with open(log, "w") as out:
-        proc = subprocess.Popen(["unshare", "--map-auto", "--map-root-user", "--mount", "--fork", "--pid",
-                                 "sh", str(script)], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1)
+        unshare_cmd = ["unshare", "--mount", "--fork", "--pid"] if os.geteuid() == 0 else [
+            "unshare", "--map-auto", "--map-root-user", "--mount", "--fork", "--pid"
+        ]
+        proc = subprocess.Popen([*unshare_cmd, "sh", str(script)], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
         ok = False
         for line in proc.stdout:
             out.write(line)
