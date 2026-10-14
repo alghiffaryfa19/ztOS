@@ -223,7 +223,7 @@ static struct {
 	.comp_algo_idx = 0,
 	.perf_profile = 1,
 	.perf_deepsleep = true,
-	.menu_speed_idx = 2,
+	.menu_speed_idx = 1,
 	.tickle = { 2, 1, 3 },
 	.dev_lock = true,
 };
@@ -318,7 +318,7 @@ static void config_load(void) {
 		} else if (strcmp(key, "slow_motion") == 0) {
 			app.dev_slow = strcmp(val, "on") == 0;
 		} else if (strcmp(key, "menu_speed") == 0) {
-			app.menu_speed_idx = 2;
+			app.menu_speed_idx = 1;
 			for (int i = 0; i < N_MENU_SPEEDS; i++) {
 				if (menu_speeds[i] == atoi(val)) app.menu_speed_idx = i;
 			}

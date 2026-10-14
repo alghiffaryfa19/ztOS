@@ -1886,7 +1886,7 @@ static void load_config(struct zt_server *server) {
 	}
 	server->scale = 4.0f;
 	server->units = 6;		/* three medium tiles across */
-	server->menu_speed = 100;
+	server->menu_speed = 75;
 	server->screen_timeout = SCREEN_TIMEOUT_S;
 	if (server->shade_brightness <= 0) {
 		server->shade_brightness = 50;

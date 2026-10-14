@@ -19,3 +19,5 @@ echo 02:5a:42:00:00:02 > "$g/functions/ncm.usb0/host_addr"
 ln -s "$g/functions/ncm.usb0" "$g/configs/c.1/"
 ln -s "$g/functions/acm.GS0" "$g/configs/c.1/"
 echo "$udc" > "$g/UDC"
+ip link set usb0 up 2>/dev/null || true
+ip addr add 172.16.42.1/24 dev usb0 2>/dev/null || true
