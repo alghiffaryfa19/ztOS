@@ -161,7 +161,7 @@ step "building ztMETRO and its apps"
 rm -rf "$R/usr/src/ztmetro"; mkdir -p "$R/usr/src"
 cp -a "$SRC/ztmetro" "$R/usr/src/ztmetro"
 rm -rf "$R/usr/src/ztmetro/ref"
-ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1; make -j"$(nproc)" >/dev/null && make install >/dev/null'
+ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1; make -j"$(nproc)" && make install'
 ch sh -c 'cd /usr/src/ztmetro && make clean >/dev/null 2>&1' || true
 
 step "adding ztOS's files"
@@ -297,6 +297,9 @@ def run_stage(s: Settings, log: Path) -> None:
     script = s.dir / "stage.sh"
     script.write_text(STAGE)
     started = time.monotonic()
+    total_pkgs = 0
+    pkg_idx = 0
+    in_progress = False
     with open(log, "w") as out:
         proc = subprocess.Popen(["unshare", "--map-auto", "--map-root-user", "--mount", "--fork", "--pid",
                                  "sh", str(script)], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -306,10 +309,47 @@ def run_stage(s: Settings, log: Path) -> None:
             out.write(line)
             out.flush()
             if line.startswith("STEP "):
+                if in_progress:
+                    print()
+                    in_progress = False
                 minutes = (time.monotonic() - started) / 60
                 say(f"[{minutes:4.1f} min] {line[5:].strip()}")
+                total_pkgs = 0
+                pkg_idx = 0
             elif line.strip() == "STAGE-OK":
                 ok = True
+            else:
+                m = re.search(r"Packages \((\d+)\)", line)
+                if m:
+                    total_pkgs = int(m.group(1))
+                    pkg_idx = 0
+                elif line.startswith("installing "):
+                    pkg_name = line[11:].rstrip(".\n")
+                    pkg_idx += 1
+                    pct = int((pkg_idx / total_pkgs) * 100) if total_pkgs > 0 else 0
+                    bar_len = 16
+                    filled = int(bar_len * pct / 100)
+                    bar = "█" * filled + "░" * (bar_len - filled)
+                    minutes = (time.monotonic() - started) / 60
+                    status = f"[{bar}] {pct:3d}% ({pkg_idx}/{total_pkgs}) installing {pkg_name}"
+                    print(f"\rztos: [{minutes:4.1f} min] {status[:60]:<60}", end="", flush=True)
+                    in_progress = True
+                elif " downloading...\n" in line:
+                    dl_name = line.split()[0] if line.split() else ""
+                    minutes = (time.monotonic() - started) / 60
+                    status = f"downloading {dl_name}"
+                    print(f"\rztos: [{minutes:4.1f} min] {status[:60]:<60}", end="", flush=True)
+                    in_progress = True
+                elif (line.startswith("cc ") or line.startswith("gcc ") or line.startswith("CC ") or
+                      line.startswith("GEN ") or " -o " in line):
+                    words = line.split()
+                    target = words[-1] if words else ""
+                    minutes = (time.monotonic() - started) / 60
+                    status = f"compiling {target}"
+                    print(f"\rztos: [{minutes:4.1f} min] {status[:60]:<60}", end="", flush=True)
+                    in_progress = True
+        if in_progress:
+            print()
         proc.wait()
     if proc.returncode != 0 or not ok:
         tail = "".join(log.read_text().splitlines(True)[-25:])
@@ -365,9 +405,12 @@ def build(s: Settings) -> Path:
     check_host()
     fetch_tarball()
     log = s.dir / "build.log"
-    s.dir.mkdir(parents=True, exist_ok=True)
-    say(f"building ztOS for {s.target} (log: {log})")
-    run_stage(s, log)
+    rootimg = s.dir / "root.img"
+    if rootimg.exists() and not s.fresh:
+        say(f"using existing system image: {rootimg}")
+    else:
+        say(f"building ztOS for {s.target} (log: {log})")
+        run_stage(s, log)
     if s.target == "qemu":
         disk = make_qemu_disk(s)
         (s.dir / "root.img").unlink(missing_ok=True)

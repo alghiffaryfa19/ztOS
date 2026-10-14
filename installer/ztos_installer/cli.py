@@ -97,7 +97,7 @@ def wizard(args) -> b.Settings:
     s.fresh = args.fresh
     print(f"\nztOS for {'the emulator' if target == 'qemu' else 'the Galaxy S9'}, user {s.user}, "
           f"named {s.hostname}, time zone {s.timezone}.")
-    print("Building it downloads about 2 GB and takes a while (30-60 minutes: ARM programs run emulated here).")
+    print("Building it downloads about 2 GB and takes a while (30-60 minutes: ARM programs run emulated because this computer is x86).")
     if not args.yes and not ask("Start?"):
         sys.exit(0)
     return s
