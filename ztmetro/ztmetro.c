@@ -139,7 +139,6 @@
 #define TOAST_H		58	/* a notification's banner, where the volume's goes */
 #define TOAST_MS	4500
 #define MAX_NOTES	12
-#define PLUG_BOX	16	/* the charging plug's own picture, points each way */
 #define STATUS_IN_MS	150	/* a status icon growing from its middle */
 #define STATUS_OUT_MS	70	/* and going: a frame or two, as on the phone */
 #define VOLUME_MAX	30
@@ -468,6 +467,7 @@ struct zt_server {
 	float plug_x, plug_y;
 	bool plug_live;			/* the status bar leaves the plug to that picture */
 	bool battery_full;
+	int battery_level;
 	uint32_t net_active_ms;		/* when the network last carried anything */
 	bool shade_row;			/* the action centre's own status row is being redrawn apart */
 	/* which quick action is in each of the action centre's eight places */
@@ -1572,18 +1572,31 @@ static void draw_icon_vector(cairo_t *cr, const char *name, double cx, double cy
 		cairo_line_to(cr, u * 0.8, u * 0.4);
 		cairo_stroke(cr);
 	} else if (strcmp(name, "plug") == 0) {
-		/* a mains plug, prongs up: two pins, a body rounded underneath,
-		 * and the cord leaving it downwards */
-		cairo_rectangle(cr, -u * 0.42, -u * 1.0, u * 0.2, u * 0.5);
-		cairo_rectangle(cr, u * 0.22, -u * 1.0, u * 0.2, u * 0.5);
-		cairo_fill(cr);
-		cairo_move_to(cr, -u * 0.7, -u * 0.5);
-		cairo_line_to(cr, u * 0.7, -u * 0.5);
-		cairo_line_to(cr, u * 0.7, -u * 0.05);
-		cairo_arc(cr, 0, -u * 0.05, u * 0.7, 0, M_PI);
+		/* Canonical Windows Phone AppBar plug (Templarian / Windows Phone SDK):
+		 * Prongs: -u*0.28..-u*0.07 and u*0.07..u*0.28, y: -u*0.95..-u*0.55
+		 * Body: -u*0.50..u*0.50, y: -u*0.55..u*0.15, rounded corners r=u*0.22
+		 * Cord: -u*0.14..u*0.14, y: u*0.15..u*0.85
+		 */
+		cairo_new_path(cr);
+		cairo_move_to(cr, u * 0.14, u * 0.15);
+		cairo_line_to(cr, u * 0.14, u * 0.85);
+		cairo_line_to(cr, -u * 0.14, u * 0.85);
+		cairo_line_to(cr, -u * 0.14, u * 0.15);
+		cairo_line_to(cr, -u * 0.28, u * 0.15);
+		cairo_curve_to(cr, -u * 0.398, u * 0.15, -u * 0.50, u * 0.052, -u * 0.50, -u * 0.07);
+		cairo_line_to(cr, -u * 0.50, -u * 0.55);
+		cairo_line_to(cr, -u * 0.28, -u * 0.55);
+		cairo_line_to(cr, -u * 0.28, -u * 0.95);
+		cairo_line_to(cr, -u * 0.07, -u * 0.95);
+		cairo_line_to(cr, -u * 0.07, -u * 0.55);
+		cairo_line_to(cr, u * 0.07, -u * 0.55);
+		cairo_line_to(cr, u * 0.07, -u * 0.95);
+		cairo_line_to(cr, u * 0.28, -u * 0.95);
+		cairo_line_to(cr, u * 0.28, -u * 0.55);
+		cairo_line_to(cr, u * 0.50, -u * 0.55);
+		cairo_line_to(cr, u * 0.50, -u * 0.07);
+		cairo_curve_to(cr, u * 0.50, u * 0.052, u * 0.398, u * 0.15, u * 0.28, u * 0.15);
 		cairo_close_path(cr);
-		cairo_fill(cr);
-		cairo_rectangle(cr, -u * 0.1, u * 0.6, u * 0.2, u * 0.4);
 		cairo_fill(cr);
 	} else if (strcmp(name, "bolt") == 0) {
 		/* charging */
@@ -3095,52 +3108,140 @@ static void status_row(struct zt_server *server, cairo_t *cr, bool details, bool
 	double clock_w = clock_px_w;
 
 	int battery = read_battery();
-	/* Measured off the sheet, as fractions of the cell's height: body 1.78
-	 * wide with a 0.12 outline, the charge inset by 0.09 inside it, and a
-	 * nub 0.18 wide standing 0.09 clear. */
-	double line = cell * 0.12, gap = cell * 0.09;
-	double bw = cell * 1.78, nub = cell * 0.18;
-	double bx = right - clock_w - cell * 0.9 - (bw + gap + nub);
+	/* Windows Phone battery & charger: crisp outline (aspect ~ 1.95),
+	 * terminal nub centered on the right, inner charge bar (warning red below 15%).
+	 * When charging, the plug sits centered with pins rising above the top line
+	 * and cord passing through the bottom line, with clean gaps cut in the outline. */
+	double line = fmax(1.0, round(cell * 0.085));
+	double gap = fmax(1.0, round(cell * 0.085));
+	double bw = round(cell * 1.95);
+	double nub_w = round(cell * 0.16);
+	double nub_h = round(cell * 0.38);
+	double bx = right - clock_w - cell * 0.9 - (bw + gap + nub_w);
 	if (battery >= 0) {
-		double inset = line + gap;
+		double y_top = base - cell;
+		double y_bot = base;
+		double cx = bx + bw / 2.0;
+		double pw = round(cell * 0.72);
+		double cw = round(cell * 0.16);
+		double prong_h = round(cell * 0.26);
+		double prong_w = round(cell * 0.13);
+		double prong_gap = round(cell * 0.15);
+		double body_h = round(cell * 0.58);
+		double corner_r = round(cell * 0.18);
+
+		cairo_set_source_rgb(cr, 1, 1, 1);
+		/* Terminal nub on the right */
+		cairo_rectangle(cr, bx + bw + gap, y_top + (cell - nub_h) / 2.0, nub_w, nub_h);
+		cairo_fill(cr);
+
+		/* Battery outline */
 		cairo_set_line_width(cr, line);
-		cairo_rectangle(cr, bx + line / 2, base - cell + line / 2, bw - line, cell - line);
-		cairo_stroke(cr);
-		cairo_rectangle(cr, bx + bw + gap, base - cell * 0.78, nub, cell * 0.56);
-		cairo_fill(cr);
-		/* the charge, always */
-		cairo_rectangle(cr, bx + inset, base - cell + inset,
-			(bw - 2 * inset) * battery / 100.0, cell - 2 * inset);
-		cairo_fill(cr);
-		if (server->charging) {
-			/* On the charger: a plug in the middle of the battery, over the
-			 * charge, in a gap cut for it; it comes and goes while the
-			 * battery fills, and stays once it is full. */
-			double pw = cell * 1.0, ph = cell - 2 * line;
-			cairo_set_source_rgb(cr, 0, 0, 0);
-			cairo_rectangle(cr, bx + bw / 2 - pw / 2, base - cell + line, pw, ph);
+		cairo_set_line_cap(cr, CAIRO_LINE_CAP_SQUARE);
+		if (!server->charging) {
+			cairo_rectangle(cr, bx + line / 2.0, y_top + line / 2.0, bw - line, cell - line);
+			cairo_stroke(cr);
+		} else {
+			/* Left wall */
+			cairo_move_to(cr, bx + line / 2.0, y_top + line / 2.0);
+			cairo_line_to(cr, bx + line / 2.0, y_bot - line / 2.0);
+			/* Right wall */
+			cairo_move_to(cr, bx + bw - line / 2.0, y_top + line / 2.0);
+			cairo_line_to(cr, bx + bw - line / 2.0, y_bot - line / 2.0);
+			/* Top line (two segments with gap around plug body) */
+			double top_cut_left = cx - pw / 2.0 - gap;
+			double top_cut_right = cx + pw / 2.0 + gap;
+			cairo_move_to(cr, bx + line / 2.0, y_top + line / 2.0);
+			cairo_line_to(cr, top_cut_left, y_top + line / 2.0);
+			cairo_move_to(cr, top_cut_right, y_top + line / 2.0);
+			cairo_line_to(cr, bx + bw - line / 2.0, y_top + line / 2.0);
+			/* Bottom line (two segments with gap around cord) */
+			double bot_cut_left = cx - cw / 2.0 - gap;
+			double bot_cut_right = cx + cw / 2.0 + gap;
+			cairo_move_to(cr, bx + line / 2.0, y_bot - line / 2.0);
+			cairo_line_to(cr, bot_cut_left, y_bot - line / 2.0);
+			cairo_move_to(cr, bot_cut_right, y_bot - line / 2.0);
+			cairo_line_to(cr, bx + bw - line / 2.0, y_bot - line / 2.0);
+			cairo_stroke(cr);
+		}
+
+		/* The charge: Windows Phone warning red below 15%, solid white otherwise */
+		double inset = line + gap;
+		double max_fill_w = bw - 2 * inset;
+		double fill_w = max_fill_w * battery / 100.0;
+		if (battery <= 15)
+			cairo_set_source_rgb(cr, 0.898, 0.078, 0.0);
+		else
+			cairo_set_source_rgb(cr, 1, 1, 1);
+		if (fill_w > 0) {
+			cairo_rectangle(cr, bx + inset, y_top + inset, fill_w, cell - 2 * inset);
 			cairo_fill(cr);
+		}
+
+		if (server->charging) {
+			/* If charge reaches into plug region, mask it out so plug stands clear */
+			double plug_mask_l = cx - pw / 2.0 - gap;
+			double plug_mask_r = cx + pw / 2.0 + gap;
+			if (bx + inset + fill_w > plug_mask_l) {
+				cairo_set_source_rgb(cr, 0, 0, 0);
+				cairo_rectangle(cr, plug_mask_l, y_top + inset, plug_mask_r - plug_mask_l, cell - 2 * inset);
+				cairo_fill(cr);
+			}
+
+			server->battery_full = battery >= 100;
+			int pw_i = (int)ceil(pw) + 4;
+			int ph_i = (int)ceil(prong_h + cell) + 4;
+			server->plug_x = (float)(cx - pw_i / 2.0);
+			server->plug_y = (float)(y_top - prong_h - 2);
+
 			if (live) {
-				/* the status bar itself: the plug is the small picture
-				 * laid over this place (see render_frame), which is
-				 * what blinks */
-				server->plug_x = (float)(bx + bw / 2 - PLUG_BOX / 2.0);
-				server->plug_y = (float)(base - cell / 2 - PLUG_BOX / 2.0);
-				server->battery_full = battery >= 100;
-				if (!server->plug_layer.tex) {
-					cairo_t *pc;
-					struct zt_buffer *pb = zt_buffer_create(server, PLUG_BOX, PLUG_BOX, &pc);
-					cairo_set_source_rgb(pc, 1, 1, 1);
-					draw_icon(pc, "plug", PLUG_BOX / 2.0, PLUG_BOX / 2.0, cell * 0.92);
-					zt_buffer_show(server, &server->plug_layer, pb, pc, PLUG_BOX, PLUG_BOX);
-				}
+				cairo_t *pc;
+				struct zt_buffer *pb = zt_buffer_create(server, pw_i, ph_i, &pc);
+				cairo_set_operator(pc, CAIRO_OPERATOR_CLEAR);
+				cairo_paint(pc);
+				cairo_set_operator(pc, CAIRO_OPERATOR_OVER);
+				cairo_set_source_rgb(pc, 1, 1, 1);
+
+				double pcx = pw_i / 2.0;
+				double py_top = 2 + prong_h;
+				/* Prongs */
+				cairo_rectangle(pc, pcx - prong_gap / 2.0 - prong_w, 2, prong_w, prong_h);
+				cairo_rectangle(pc, pcx + prong_gap / 2.0, 2, prong_w, prong_h);
+				cairo_fill(pc);
+				/* Plug body */
+				cairo_new_sub_path(pc);
+				cairo_move_to(pc, pcx - pw / 2.0, py_top);
+				cairo_line_to(pc, pcx + pw / 2.0, py_top);
+				cairo_line_to(pc, pcx + pw / 2.0, py_top + body_h - corner_r);
+				cairo_arc(pc, pcx + pw / 2.0 - corner_r, py_top + body_h - corner_r, corner_r, 0, M_PI / 2);
+				cairo_line_to(pc, pcx - pw / 2.0 + corner_r, py_top + body_h);
+				cairo_arc(pc, pcx - pw / 2.0 + corner_r, py_top + body_h - corner_r, corner_r, M_PI / 2, M_PI);
+				cairo_close_path(pc);
+				cairo_fill(pc);
+				/* Cord */
+				cairo_rectangle(pc, pcx - cw / 2.0, py_top + body_h - 1, cw, cell - body_h + 1);
+				cairo_fill(pc);
+
+				zt_buffer_show(server, &server->plug_layer, pb, pc, pw_i, ph_i);
 			} else {
-				/* upright, pins up, as the phone has it */
-				cairo_save(cr);
-				cairo_translate(cr, bx + bw / 2, base - cell / 2);
 				cairo_set_source_rgb(cr, 1, 1, 1);
-				draw_icon(cr, "plug", 0, 0, cell * 0.92);
-				cairo_restore(cr);
+				/* Prongs */
+				cairo_rectangle(cr, cx - prong_gap / 2.0 - prong_w, y_top - prong_h, prong_w, prong_h);
+				cairo_rectangle(cr, cx + prong_gap / 2.0, y_top - prong_h, prong_w, prong_h);
+				cairo_fill(cr);
+				/* Plug body */
+				cairo_new_sub_path(cr);
+				cairo_move_to(cr, cx - pw / 2.0, y_top);
+				cairo_line_to(cr, cx + pw / 2.0, y_top);
+				cairo_line_to(cr, cx + pw / 2.0, y_top + body_h - corner_r);
+				cairo_arc(cr, cx + pw / 2.0 - corner_r, y_top + body_h - corner_r, corner_r, 0, M_PI / 2);
+				cairo_line_to(cr, cx - pw / 2.0 + corner_r, y_top + body_h);
+				cairo_arc(cr, cx - pw / 2.0 + corner_r, y_top + body_h - corner_r, corner_r, M_PI / 2, M_PI);
+				cairo_close_path(cr);
+				cairo_fill(cr);
+				/* Cord */
+				cairo_rectangle(cr, cx - cw / 2.0, y_top + body_h - 1, cw, cell - body_h + 1);
+				cairo_fill(cr);
 			}
 			cairo_set_source_rgb(cr, 1, 1, 1);
 		}
@@ -3368,11 +3469,13 @@ static int net_tick(void *data) {
 	server->net_active = active;
 
 	bool charging = on_charger();
-	if (charging != server->charging) {
+	int battery = read_battery();
+	if (charging != server->charging || (battery >= 0 && battery != server->battery_level)) {
 		server->charging = charging;
+		server->battery_level = battery;
 		snap(server, &server->st_plug, 1.0f);
 		redraw = true;
-	} else if (charging && read_battery() < 100) {
+	} else if (charging && battery < 100) {
 		/* there for a second, faint for a second */
 		animate(server, &server->st_plug, anim_target(server, &server->st_plug) > 0.5f ? 0.15f : 1.0f,
 			420, 0, false);
@@ -5786,6 +5889,9 @@ static void screen_set(struct zt_server *server, bool on) {
 	}
 	wlr_output_state_finish(&state);
 	server->screen_on = on;
+	if (on)
+		backlight_set(server->shade_brightness);	/* the panel comes back at its
+							 * boot level otherwise: a flash */
 	wlr_log(WLR_INFO, "screen %s", on ? "on" : "off");
 	if (!on) {
 		perf_tell("screen off\n");
@@ -7905,6 +8011,7 @@ int main(int argc, char *argv[]) {
 	server.dialog_h = 240;
 	server.dialog_y = -240.0f;
 	server.drop_card = -1;
+	server.battery_level = -1;
 	server.shade_brightness = 50;	/* until the config says what it was left at */
 	server.shade_wifi = wifi_up();
 	server.shade_pressed = -1;

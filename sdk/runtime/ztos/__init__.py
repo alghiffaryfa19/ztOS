@@ -268,7 +268,10 @@ ENTER_STAGGER_MS, ENTER_ROW_MS, ENTER_TRAVEL = 28, 190, 50.0
 ENTER_TITLE_TRAVEL, ENTER_TITLE_MS, ENTER_HOLD_MS = 35.0, 200, 60
 PIVOT_FLICK = 0.3           # points per ms that throw the tabs on to the next
 PIVOT_SPRING_W = 0.018      # per ms: in place in about a quarter second
-ANIM_DPR = 2.0              # pixels per point while things move: a quarter of the work
+ANIM_DPR = 2.0              # pixels per point while things move: a quarter of the work.
+                            # Raised per-p picture where it is cheap: the lean of a row
+                            # (LEAN_DPR) is drawn native, or its edges look jagged.
+LEAN_DPR = 4.0              # pixels per point for a pressable's flat picture
 HEADER_H = 108
 
 
@@ -338,7 +341,7 @@ class _Moving(QWidget):
         self.compose(p)
         p.end()
         screen = QPainter(self)
-        screen.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        screen.setRenderHint(QPainter.SmoothPixmapTransform, True)
         screen.drawImage(QRectF(0, 0, w, h), self._frame)
 
 
@@ -652,7 +655,7 @@ class _Pressable(QWidget):
         p = self._amount()
         if p <= 0.001 or self._flat_drawing:
             return False
-        if self._flat is None or self._flat.size() != self.size() * ANIM_DPR:
+        if self._flat is None or self._flat.size() != self.size() * LEAN_DPR:
             self._flat_drawing = True
             try:
                 self._flat = _snapshot(self)
@@ -2098,10 +2101,11 @@ QWidget { color: white; font-family: %(fonts)s; font-size: 15px; }
 QScrollArea, QScrollArea > QWidget > QWidget { background: black; border: none; }
 QScrollBar { width: 0px; height: 0px; }
 QLabel { background: transparent; }
-QPushButton { background: transparent; border: 2px solid white; padding: 6px 14px; min-height: 26px;
+QPushButton { background: transparent; border: none; border-radius: 4px; padding: 6px 14px; min-height: 26px;
     font-size: 16px; }
-QPushButton:pressed { background: %(accent)s; border-color: %(accent)s; }
-QPushButton:disabled { color: #666; border-color: #666; }
+QPushButton:pressed { background: %(accent)s; color: white; }
+QPushButton:focus { outline: none; }
+QPushButton:disabled { color: #666; }
 QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QDateEdit, QTimeEdit {
     background: #c7c7c7; color: black; border: 2px solid #c7c7c7; padding: 4px 8px; font-size: 17px;
     selection-background-color: %(accent)s; selection-color: white; }
