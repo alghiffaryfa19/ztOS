@@ -1066,10 +1066,25 @@ static void ctl_readable(void)
 
 static void wifi_read(void)
 {
-	FILE *p = popen("for d in /sys/class/net/w*; do [ \"$(cat $d/operstate 2>/dev/null)\" = up ] && "
-		"iw dev ${d##*/} link 2>/dev/null; done", "r");
-	char l[256];
 	now.wifi_bars = -1;
+	char l[256];
+
+	/* 1. NetworkManager active Wi-Fi connection and signal percentage */
+	FILE *p = popen("nmcli -t -f IN-USE,SIGNAL dev wifi 2>/dev/null | grep '^\\*:' | head -1", "r");
+	if (p) {
+		if (fgets(l, sizeof(l), p)) {
+			int sig = 0;
+			if (sscanf(l, "*:%d", &sig) == 1) {
+				now.wifi_bars = sig >= 75 ? 3 : sig >= 50 ? 2 : sig >= 25 ? 1 : 0;
+			}
+		}
+		pclose(p);
+	}
+	if (now.wifi_bars >= 0)
+		return;
+
+	/* 2. iw dev ... link */
+	p = popen("for d in /sys/class/net/w*; do [ -d \"$d\" ] && iw dev ${d##*/} link 2>/dev/null; done", "r");
 	while (p && fgets(l, sizeof(l), p)) {
 		int dbm;
 		if (!strncmp(l, "Connected", 9) && now.wifi_bars < 0)
@@ -1079,6 +1094,18 @@ static void wifi_read(void)
 	}
 	if (p)
 		pclose(p);
+	if (now.wifi_bars >= 0)
+		return;
+
+	/* 3. sysfs link carrier or operstate */
+	p = popen("for d in /sys/class/net/w*; do "
+		"[ \"$(cat $d/carrier 2>/dev/null)\" = 1 ] && echo up && break; "
+		"[ \"$(cat $d/operstate 2>/dev/null)\" = up ] && echo up && break; done", "r");
+	if (p) {
+		if (fgets(l, sizeof(l), p) && strncmp(l, "up", 2) == 0)
+			now.wifi_bars = 3;
+		pclose(p);
+	}
 }
 
 /* ---- the loop ------------------------------------------------------------ */

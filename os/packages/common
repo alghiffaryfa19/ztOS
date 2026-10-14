@@ -7,6 +7,7 @@ sudo
 polkit
 networkmanager
 wpa_supplicant
+iw
 openssh
 xdg-user-dirs
 alsa-utils

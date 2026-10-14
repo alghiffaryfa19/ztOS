@@ -2778,11 +2778,20 @@ static bool wifi_up(void) {
 			continue;
 		}
 		char path[300], state[16] = "";
-		snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", entry->d_name);
+		snprintf(path, sizeof(path), "/sys/class/net/%s/carrier", entry->d_name);
 		FILE *f = fopen(path, "r");
 		if (f) {
-			up = fgets(state, sizeof(state), f) && strncmp(state, "up", 2) == 0;
+			up = fgets(state, sizeof(state), f) && state[0] == '1';
 			fclose(f);
+		}
+		if (!up) {
+			snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", entry->d_name);
+			f = fopen(path, "r");
+			if (f) {
+				up = fgets(state, sizeof(state), f) &&
+					(strncmp(state, "up", 2) == 0 || strncmp(state, "dormant", 7) == 0);
+				fclose(f);
+			}
 		}
 	}
 	if (dir) {
@@ -2937,14 +2946,23 @@ static void status_pop_end(cairo_t *cr, float t) {
  * drawn in three places; nothing wakes up to ask. */
 static int wifi_bars(struct zt_server *server) {
 	uint32_t now = now_ms();
-	/* ztoscorenetworkingd measures the link (it runs `iw` so that we never wait on a
-	 * program); what it wrote is good for a while */
+	/* If ztoscorenetworkingd reported active bars, use it */
+	if (server->wifi_read_ms && now - server->wifi_read_ms < 40000 && server->wifi_bars >= 0) {
+		return server->wifi_bars;
+	}
+	/* Without it or if ztoscorenetworkingd had -1: check sysfs carrier/operstate */
+	if (wifi_up()) {
+		if (server->wifi_bars < 0) {
+			server->wifi_bars = 3;
+		}
+		server->wifi_read_ms = now ? now : 1;
+		return server->wifi_bars;
+	}
 	if (server->wifi_read_ms && now - server->wifi_read_ms < 40000) {
 		return server->wifi_bars;
 	}
-	/* without it: whether an interface is up, from sysfs, all bands lit */
 	server->wifi_read_ms = now ? now : 1;
-	server->wifi_bars = wifi_up() ? 3 : -1;
+	server->wifi_bars = -1;
 	return server->wifi_bars;
 }
 
