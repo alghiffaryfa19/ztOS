@@ -82,6 +82,8 @@ enum action {
 	ACT_TIMEOUT_CYCLE,
 	ACT_SCALE_CYCLE,
 	ACT_NAV_SIZE_CYCLE,
+	ACT_KEY_HEIGHT,
+	ACT_KEY_SOUND,
 	ACT_MOBILE_DATA,
 	ACT_ROAMING,
 	ACT_NETWORK_MODE,
@@ -112,6 +114,7 @@ enum action {
 	ACT_APN_FIELD,		/* arg: which box */
 	ACT_APN_AUTH,
 	ACT_APN_SAVE,
+	ACT_ABOUT_REPO,
 	ACT_QUICK_SLOT,		/* then one for each of the eight places */
 	ACT_QUICK_LAST = ACT_QUICK_SLOT + 7,
 };
@@ -178,6 +181,8 @@ static struct {
 	bool roaming;
 	int network_mode;
 
+	int key_height;
+	bool key_sound;
 	int media_vol;
 	int ring_vol;
 	bool vibrate_ring;
@@ -195,6 +200,7 @@ static struct {
 	int tickle[3];		/* mode on battery, plugged in, power saver: 0 none .. 3 high */
 	char tickle_now[96];	/* what zrnperfd says it is doing */
 	bool dev_demo_tiles, dev_slow, dev_touches, dev_lock;
+	bool about_show_repo;
 	int menu_speed_idx;	/* the UI's animation speed: an index into menu_speeds */
 	int haptic_strength;	/* percent */
 	int haptic_group[N_HAPTIC_GROUPS];	/* percent of the strength; 0 off */
@@ -214,6 +220,8 @@ static struct {
 	.mobile_data = true,
 	.roaming = false,
 	.network_mode = 0,
+	.key_height = 56,
+	.key_sound = true,
 	.media_vol = 80,
 	.ring_vol = 70,
 	.vibrate_ring = true,
@@ -285,7 +293,16 @@ static void config_load(void) {
 					break;
 				}
 			}
-		} else if (strcmp(key, "columns") == 0) {
+		} else if (strcmp(key, "key_height") == 0) {
+            int n = atoi(val);
+            app.key_height = n < 42 ? 42 : n > 72 ? 72 : n;
+        } else if (strcmp(key, "key_sound") == 0) {
+            app.key_sound = strcmp(val, "off") != 0 && strcmp(val, "0") != 0;
+        } else if (strcmp(key, "ring_volume") == 0) {
+            app.ring_vol = atoi(val) < 0 ? 0 : atoi(val) > 100 ? 100 : atoi(val);
+        } else if (strcmp(key, "media_volume") == 0) {
+            app.media_vol = atoi(val) < 0 ? 0 : atoi(val) > 100 ? 100 : atoi(val);
+        } else if (strcmp(key, "columns") == 0) {
 			app.columns = atoi(val);
 		} else if (strcmp(key, "haptics") == 0) {
 			app.haptics = strcmp(val, "off") != 0 && strcmp(val, "0") != 0;
@@ -454,23 +471,29 @@ static void auto_load(void) {
 
 static void config_save(void) {
 	static const int timeouts[] = { 30, 60, 180, 300, 0 };
-	enum { N_KEYS = 13 + N_HAPTIC_GROUPS };
+	enum { N_KEYS = 17 + N_HAPTIC_GROUPS };
 	struct { const char *key; char value[128]; bool written; } keys[N_KEYS] = {
 		{ .key = "accent" }, { .key = "columns" }, { .key = "haptics" },
 		{ .key = "brightness" }, { .key = "timeout" }, { .key = "demo_tiles" },
 		{ .key = "slow_motion" }, { .key = "show_touches" }, { .key = "lock" },
 		{ .key = "menu_speed" }, { .key = "haptic_strength" }, { .key = "quick" },
 		{ .key = "wifi_suspend" },
+		{ .key = "key_height" }, { .key = "key_sound" },
+		{ .key = "ring_volume" }, { .key = "media_volume" },
 	};
-	snprintf(keys[10].value, 32, "%d", app.haptic_strength);
+	snprintf(keys[13].value, 32, "%d", app.key_height);
+    snprintf(keys[14].value, 32, "%s", app.key_sound ? "on" : "off");
+    snprintf(keys[15].value, 32, "%d", app.ring_vol);
+    snprintf(keys[16].value, 32, "%d", app.media_vol);
+    snprintf(keys[10].value, 32, "%d", app.haptic_strength);
 	for (int i = 0; i < 8; i++) {
 		size_t at = strlen(keys[11].value);
 		snprintf(keys[11].value + at, sizeof(keys[11].value) - at, "%s%s", i ? "," : "", QUICK_IDS[app.quick[i]]);
 	}
 	snprintf(keys[12].value, 32, "%s", app.wifi_suspend ? "on" : "off");
 	for (int g = 0; g < N_HAPTIC_GROUPS; g++) {
-		keys[13 + g].key = HAPTIC_GROUPS[g].key;
-		snprintf(keys[13 + g].value, 32, "%d", app.haptic_group[g]);
+		keys[17 + g].key = HAPTIC_GROUPS[g].key;
+		snprintf(keys[17 + g].value, 32, "%d", app.haptic_group[g]);
 	}
 	snprintf(keys[0].value, 32, "%s", ACCENTS[app.accent].name);
 	snprintf(keys[1].value, 32, "%d", app.columns);
@@ -1364,6 +1387,12 @@ static double draw_gpu(cairo_t *cr) {
 
 static double draw_keyboard(cairo_t *cr) {
 	double y = zmc_header(cr, "keyboard");
+    char height[64];
+    snprintf(height, sizeof(height), "Key height: %d", app.key_height);
+    zmc_slider(cr, MARGIN, y, zmc.width - 2 * MARGIN,
+        (app.key_height - 42) * 100 / 30, height, ACT_KEY_HEIGHT);
+    y += 76;
+    y = zmc_switch(cr, y, "Keyboard sounds", app.key_sound, ACT_KEY_SOUND);
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	zmc_text(cr, "Vibrate on touch and typing", FONT_SEMILIGHT, 21, MARGIN, y, 0);
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
@@ -1473,6 +1502,20 @@ static double draw_about(cairo_t *cr) {
 		cairo_set_source_rgb(cr, 1, 1, 1);
 		y += zmc_text(cr, value, FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 30;
 	}
+
+	double start_y = y;
+	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
+	zmc_text(cr, "a project by", FONT_REGULAR, 13, MARGIN, y, 0);
+	cairo_set_source_rgb(cr, 1, 1, 1);
+	y += zmc_text(cr, "Zerone Brianstorm AKA Ometh Abeyrathne", FONT_SEMILIGHT, 19, MARGIN, y + 18, zmc.width - 2 * MARGIN) + 26;
+
+	if (app.about_show_repo) {
+		zmc_accent(cr);
+		y += zmc_text(cr, "https://github.com/z3r0n3br4instorm/ztOS", FONT_REGULAR, 13, MARGIN, y, zmc.width - 2 * MARGIN) + 24;
+	} else {
+		y += 4;
+	}
+	zmc_add_hit(0, start_y - 4, zmc.width, y - start_y + 4, ACT_ABOUT_REPO, 0);
 
 	return y + 10;
 }
@@ -1605,6 +1648,9 @@ static void activate(int action, int arg) {
 		apn_focus = -1;
 		zmc_keyboard(false);
 		apn_save();
+		break;
+	case ACT_ABOUT_REPO:
+		app.about_show_repo = !app.about_show_repo;
 		break;
 	case ACT_HAPTIC_TRY: {
 		static const char *const pulses[] = { "tick system", "tap system", "click system", "heavy system" };
@@ -1825,6 +1871,10 @@ static void activate(int action, int arg) {
 	case ACT_SCALE_CYCLE:
 		app.scale_idx = arg;	/* shown only: the shell's scale is fixed for now */
 		break;
+	case ACT_KEY_SOUND:
+		app.key_sound = !app.key_sound;
+		config_save();
+		break;
 	case ACT_NAV_SIZE_CYCLE:
 		app.nav_size_idx = arg;
 		break;
@@ -1843,6 +1893,7 @@ static void activate(int action, int arg) {
 		break;
 	case ACT_MEDIA_VOL_STEP:
 		app.media_vol = (app.media_vol >= 100) ? 0 : app.media_vol + 20;
+		config_save();
 		{
 			char cmd[64];
 			snprintf(cmd, sizeof(cmd), "pactl set-sink-volume @DEFAULT_SINK@ %d%% 2>/dev/null &", app.media_vol);
@@ -1851,6 +1902,7 @@ static void activate(int action, int arg) {
 		break;
 	case ACT_RING_VOL_STEP:
 		app.ring_vol = (app.ring_vol >= 100) ? 0 : app.ring_vol + 20;
+		config_save();
 		break;
 	case ACT_VIBRATE_RING:
 		app.vibrate_ring = !app.vibrate_ring;
@@ -1945,15 +1997,21 @@ static void slide(int action, int value, bool done) {
 			config_save();	/* the shell plays a click at the new strength */
 		}
 		break;
-	case ACT_MEDIA_VOL_STEP:
-		app.media_vol = value;
+	case ACT_KEY_HEIGHT:
+        app.key_height = 42 + value * 30 / 100;
+        if (done) config_save();
+        break;
+    case ACT_MEDIA_VOL_STEP:
+        app.media_vol = value;
 		if (done) {
+			config_save();
 			snprintf(cmd, sizeof(cmd), "pactl set-sink-volume @DEFAULT_SINK@ %d%% 2>/dev/null &", value);
 			if (system(cmd) != 0) {}
 		}
 		break;
 	case ACT_RING_VOL_STEP:
 		app.ring_vol = value;
+		if (done) config_save();
 		break;
 	case ACT_SWAPPINESS_STEP:
 		app.swappiness = value;
@@ -2154,6 +2212,9 @@ int main(int argc, char **argv) {
 		/* ZT_OPEN_PICKER=ACTION draws that list picker open, for reviews */
 		if (getenv("ZT_OPEN_PICKER")) {
 			open_picker = atoi(getenv("ZT_OPEN_PICKER"));
+		}
+		if (getenv("ZT_ABOUT_REPO")) {
+			app.about_show_repo = true;
 		}
 		return render_to_file(argv[2], argv[3]);
 	}

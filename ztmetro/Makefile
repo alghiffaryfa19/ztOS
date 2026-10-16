@@ -1,13 +1,16 @@
 # Builds on the phone itself (aarch64 Arch Linux ARM, wlroots 0.20).
 PKGS = wlroots-0.20 wayland-server xkbcommon cairo pangocairo librsvg-2.0 pixman-1 libdrm egl glesv2
-APP_PKGS = wayland-client wayland-egl egl glesv2 cairo pangocairo
+APP_PKGS = xkbcommon wayland-client wayland-egl egl glesv2 cairo pangocairo
 WP := $(shell pkg-config --variable=pkgdatadir wayland-protocols)
 XDG := $(WP)/stable/xdg-shell/xdg-shell.xml
 CFLAGS ?= -O2 -g
 WARN = -std=c11 -Wall -Wno-unused-parameter
 
-all: ztmetro apps/ztapps settings/ztsettings devtest/zrndevtest perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd \
+all: sounds/ztos-sounds ztmetro apps/ztapps settings/ztsettings devtest/zrndevtest perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd \
 	csf/ztoscsf notifyd/ztnotifyd phone/ztphone messages/ztmessages contacts/ztcontacts
+
+sounds/ztos-sounds: sounds/ztos-sounds.c
+	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags libpulse) -o $@ $< $(shell pkg-config --libs libpulse) -lm
 
 ztmetro: ztmetro.c xdg-shell-protocol.h
 	$(CC) $(CFLAGS) $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
@@ -64,6 +67,10 @@ contacts/ztcontacts: contacts/ztcontacts.c comm/comm.h $(CORE_DEPS)
 csf/ztoscsf: csf/ztoscsf.c
 	$(CC) $(CFLAGS) $(WARN) -o $@ csf/ztoscsf.c
 
+splash/ztos-splash: splash/ztos-splash.c
+	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags cairo pangocairo) -o $@ splash/ztos-splash.c \
+		$(shell pkg-config --libs cairo pangocairo)
+
 core/xdg-shell-client-protocol.h:
 	wayland-scanner client-header $(XDG) $@
 
@@ -78,8 +85,10 @@ core/viewporter-protocol.c:
 	wayland-scanner private-code $(VIEWPORTER) $@
 
 install: all
+	install -Dm755 sounds/ztos-sounds /usr/local/bin/ztos-sounds
 	install -Dm755 ztmetro /usr/local/bin/ztmetro
 	install -Dm755 ztmetro-session /usr/local/bin/ztmetro-session
+	install -Dm755 splash/ztos-splash /usr/local/bin/ztos-splash
 	install -Dm755 apps/ztapps /usr/local/bin/ztapps
 	install -Dm755 settings/ztsettings /usr/local/bin/ztsettings
 	install -Dm755 devtest/zrndevtest /usr/local/bin/zrndevtest
@@ -101,5 +110,5 @@ install: all
 	install -Dm644 csf/ztoscoresensorframework.service /etc/systemd/system/ztoscoresensorframework.service
 
 clean:
-	rm -f ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf \
+	rm -f sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf \
 		core/xdg-shell-client-protocol.h core/xdg-shell-protocol.c

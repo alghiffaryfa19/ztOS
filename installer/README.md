@@ -87,6 +87,11 @@ installer/ztos install --target starlte
 5. **The first start takes about a minute** while ztOS grows to fill the
    storage. Then the Welcome app shows how ztOS is used.
 
+The phone image arms `zboot-firstboot.service` on every build, including
+reused build trees. It expands the ext4 filesystem to fill the existing
+USERDATA partition. Failed initialization keeps its marker so the next boot
+retries. Check the result with `df -h /`.
+
 If the phone ever fails to start, it falls back to TWRP by itself. Run the
 installer again from step 3.
 
@@ -100,9 +105,10 @@ is; rebuild it from the current source to include later kernel fixes.
 | | |
 |---|---|
 | Shell | ztMETRO, and only ztMETRO: no other desktop is installed |
-| First start | Welcome: Start and tiles, getting around (back, the app switcher, the action centre, the keyboard), your apps, updates, making apps |
-| Apps | Settings, ZrnDevTest, Phone, Messaging, People, GNOME Terminal, Firefox, Chromium, Updates |
-| Updates | the Updates app; a daily check that notifies you when there are updates, and nothing installed without you (`ztos-update check` / `apply`, run by systemd) |
+| First start | Welcome: Start and tiles, getting around (back, the app switcher, the action centre, the keyboard), your apps, making apps |
+| Apps | Settings, ZrnDevTest, Phone, Messaging, People, Music (eco; streaming and offline playback), WhatsApp (eco; linked-device text messaging), GNOME Terminal, Firefox, Chromium |
+| Updates | Command-line updater (`ztos-update check` / `apply`) and daily check; the Updates application is not preloaded yet |
+| Equalizers | Equalizer applications and EasyEffects are not preinstalled |
 | Developing | the ztOS SDK is installed (`ztos-sdk`), with its warm runtime started with the session; see `sdk/README.md` |
 
 ## How the build works
@@ -116,7 +122,7 @@ is; rebuild it from the current source to include later kernel fixes.
 3. Builds ztMETRO and its apps from `ztmetro/` inside the system.
 4. Adds `os/overlay/` (ztOS's identity, session, updater, default tiles,
    fonts), the target's own overlay, the SDK, and ztOS's apps (built from
-   `os/apps/` with the SDK).
+   selected projects in `os/apps/` and Music in `apps/music/` with the SDK).
 5. Creates your account, turns on ztOS's services, and writes:
    - for the emulator, a GPT disk with systemd-boot and the generic kernel
    - for the phone, the system image for USERDATA (the boot image comes from

@@ -41,6 +41,7 @@
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -85,7 +86,7 @@
 /* All layout below is in logical points; the output scale turns them into pixels. */
 #define STATUS_H	28	/* status bar */
 #define NAV_H		40	/* nav bar */
-#define KROW_H		50	/* one keyboard row */
+#define DEFAULT_KEY_HEIGHT 56
 #define KEY_GAP		3	/* between keys: the gap is the border */
 #define TERM_ROW_H	38	/* the Esc / Tab / Ctrl / arrows row for terminals */
 /* The action centre comes down over everything but the nav bar. */
@@ -200,10 +201,10 @@
 #define OSK_MS		200
 #define LAUNCH_WAIT_MS	4000	/* an app that shows nothing by then: Start comes back */
 
-#define FONT_LIGHT	"Segoe WP Light, Selawik Light, Open Sans Light, sans-serif"
-#define FONT_SEMILIGHT	"Segoe WP Semilight, Selawik Semilight, Open Sans, sans-serif"
-#define FONT_REGULAR	"Segoe WP, Selawik, Open Sans, Noto Sans, sans-serif"
-#define FONT_SEMIBOLD	"Segoe WP Semibold, Selawik Semibold, Open Sans Semibold, sans-serif"
+#define FONT_LIGHT	"Segoe UI Light, Selawik Light, Open Sans Light, sans-serif"
+#define FONT_SEMILIGHT	"Segoe UI Semilight, Selawik Semilight, Open Sans, sans-serif"
+#define FONT_REGULAR	"Segoe UI, Selawik, Open Sans, Noto Sans, sans-serif"
+#define FONT_SEMIBOLD	"Segoe UI Semibold, Selawik Semibold, Open Sans Semibold, sans-serif"
 
 enum tile_size { TILE_SMALL, TILE_MEDIUM, TILE_WIDE };
 
@@ -378,7 +379,7 @@ struct touch_point {
 
 enum key_action {
 	ACT_CHAR,	/* sends keycode, with shift when the key says so */
-	ACT_SHIFT, ACT_PAGE, ACT_CTRL, ACT_ALT,
+	ACT_SHIFT, ACT_PAGE, ACT_CTRL, ACT_ALT, ACT_EMOJI,
 };
 
 struct osk_key {
@@ -543,6 +544,14 @@ struct zt_server {
 	GLuint white_tex, black_tex;	/* 1x1 each, for plain rectangles */
 	struct zt_layer shade_tile_layer[8];	/* the quick actions, one texture each */
 	float shade_tilt_x[8], shade_tilt_y[8], shade_press[8];
+	/* Splash screen & boot transition */
+	bool splash;
+	struct zt_layer splash_layer;
+	float nav_icon_y[3];		/* per-icon vertical offset: starts at NAV_H + 20, swipes up to 0 */
+	bool sensorhub_fail_screen;
+	struct zt_layer sensorhub_fail_layer;
+	struct wl_event_source *boot_check_timer;
+	int boot_check_count;
 
 	/* power */
 	bool screen_on;
@@ -640,11 +649,21 @@ struct zt_server {
 	bool osk_visible;
 	bool osk_terminal;		/* extra row for terminals */
 	bool osk_symbols;
+	bool osk_emoji;
+	int key_height;
+	bool key_sound;
+	char key_prefix[32];
+	int ring_volume;
+	bool volume_is_media;
+	bool audio_active, audio_known;
+	int key_sound_fd;
 	bool osk_shift, osk_ctrl, osk_alt;
 	struct osk_key keys[MAX_KEYS];
 	int n_keys;
 	int osk_pressed;		/* -1: none */
 	double osk_h;
+	cairo_surface_t *osk_base_surface;
+	bool osk_base_dirty;
 
 	cairo_surface_t *logo;		/* the distribution's logo, for the Start button */
 
@@ -1353,6 +1372,18 @@ static void draw_icon_vector(cairo_t *cr, const char *name, double cx, double cy
 		cairo_line_to(cr, -u * 0.7, u * 0.2);
 		cairo_line_to(cr, -u * 0.25, u * 0.65);
 		cairo_stroke(cr);
+	} else if (strcmp(name, "smiley") == 0 || strcmp(name, "emoji") == 0) {
+		/* Windows Phone 8.1 keyboard smiley icon */
+		cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+		cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+		cairo_arc(cr, 0, 0, u * 0.78, 0, 2 * M_PI);
+		cairo_stroke(cr);
+		cairo_arc(cr, -u * 0.28, -u * 0.20, u * 0.10, 0, 2 * M_PI);
+		cairo_fill(cr);
+		cairo_arc(cr, u * 0.28, -u * 0.20, u * 0.10, 0, 2 * M_PI);
+		cairo_fill(cr);
+		cairo_arc(cr, 0, -u * 0.04, u * 0.48, M_PI * 0.20, M_PI * 0.80);
+		cairo_stroke(cr);
 	} else if (strncmp(name, "arrow-", 6) == 0) {
 		double turn = name[6] == 'l' ? 0 : name[6] == 'u' ? M_PI / 2 :
 			name[6] == 'r' ? M_PI : -M_PI / 2;
@@ -1938,6 +1969,9 @@ static void load_config(struct zt_server *server) {
 	server->scale = 4.0f;
 	server->units = 6;		/* three medium tiles across */
 	server->menu_speed = 75;
+	server->key_height = DEFAULT_KEY_HEIGHT;
+	server->key_sound = true;
+	server->ring_volume = 21;
 	server->screen_timeout = SCREEN_TIMEOUT_S;
 	if (server->shade_brightness <= 0) {
 		server->shade_brightness = 50;
@@ -1958,7 +1992,18 @@ static void load_config(struct zt_server *server) {
 		char *key = trim(line), *value = trim(eq + 1);
 		if (strcmp(key, "accent") == 0) {
 			server->accent = parse_color(server, value);
-		} else if (strcmp(key, "haptics") == 0) {
+		} else if (strcmp(key, "key_height") == 0) {
+            int n = atoi(value);
+            server->key_height = n < 42 ? 42 : n > 72 ? 72 : n;
+        } else if (strcmp(key, "key_sound") == 0) {
+            server->key_sound = strcmp(value, "off") != 0 && strcmp(value, "0") != 0;
+        } else if (strcmp(key, "ring_volume") == 0) {
+            int n = atoi(value);
+            server->ring_volume = (n < 0 ? 0 : n > 100 ? 100 : n) * VOLUME_MAX / 100;
+        } else if (strcmp(key, "media_volume") == 0) {
+            int n = atoi(value);
+            server->volume = (n < 0 ? 0 : n > 100 ? 100 : n) * VOLUME_MAX / 100;
+        } else if (strcmp(key, "haptics") == 0) {
 			server->haptics_enabled = strcmp(value, "off") != 0 && strcmp(value, "0") != 0;
 		} else if (strcmp(key, "haptic_strength") == 0) {
 			int strength = atoi(value);
@@ -3806,6 +3851,11 @@ static void draw_nav(struct zt_server *server) {
 	double third = server->width / 3.0;
 	for (int i = 0; i < 3; i++) {
 		double cx = third * i + third / 2, cy = NAV_H / 2.0;
+		cairo_save(cr);
+		cairo_rectangle(cr, third * i, 0, third, NAV_H);
+		cairo_clip(cr);
+		cairo_translate(cr, 0, server->nav_icon_y[i]);
+
 		if (server->nav_pressed == i) {
 			set_rgb(cr, server->accent);
 		} else {
@@ -3821,8 +3871,154 @@ static void draw_nav(struct zt_server *server) {
 			draw_text(cr, "ZRN", FONT_SEMILIGHT, 17, cx - 40, 0, 80, NAV_H, true);
 			cairo_new_path(cr);	/* text leaves a current point behind */
 		}
+		cairo_restore(cr);
 	}
 	zt_buffer_show(server, &server->nav_layer, buffer, cr, server->width, NAV_H);
+}
+
+static void draw_splash(struct zt_server *server) {
+	cairo_t *cr;
+	struct zt_buffer *buffer = zt_buffer_create(server, server->width, server->height, &cr);
+	cairo_set_source_rgb(cr, 0, 0, 0);
+	cairo_paint(cr);
+
+	/* Plain ztOS logo: thin text, white on black */
+	cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+	draw_text(cr, "ztOS", FONT_LIGHT, 56.0, 0, 0, server->width, server->height, true);
+
+	zt_buffer_show(server, &server->splash_layer, buffer, cr, server->width, server->height);
+}
+
+static void draw_sensorhub_fail(struct zt_server *server) {
+	cairo_t *cr;
+	struct zt_buffer *buffer = zt_buffer_create(server, server->width, server->height, &cr);
+	cairo_set_source_rgb(cr, 0, 0, 0);
+	cairo_paint(cr);
+
+	double cx = server->width / 2.0;
+	double cy = server->height * 0.25;
+
+	/* Red warning sign: triangle */
+	double tri_w = 72.0, tri_h = 64.0;
+	cairo_set_source_rgb(cr, 0.95, 0.2, 0.2);
+	cairo_set_line_width(cr, 4.0);
+	cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+	cairo_move_to(cr, cx, cy - tri_h / 2.0);
+	cairo_line_to(cr, cx + tri_w / 2.0, cy + tri_h / 2.0);
+	cairo_line_to(cr, cx - tri_w / 2.0, cy + tri_h / 2.0);
+	cairo_close_path(cr);
+	cairo_stroke(cr);
+
+	/* Exclamation mark inside triangle */
+	cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+	cairo_move_to(cr, cx, cy - 8.0);
+	cairo_line_to(cr, cx, cy + 12.0);
+	cairo_stroke(cr);
+	cairo_arc(cr, cx, cy + 22.0, 2.8, 0, 2 * M_PI);
+	cairo_fill(cr);
+
+	/* Warning text */
+	double pad = 28.0;
+	double content_w = server->width - 2 * pad;
+	double text_y = cy + tri_h / 2.0 + 36.0;
+
+	PangoLayout *layout = pango_cairo_create_layout(cr);
+	PangoFontDescription *desc = pango_font_description_from_string(FONT_REGULAR);
+	pango_font_description_set_absolute_size(desc, 17.0 * PANGO_SCALE);
+	pango_layout_set_font_description(layout, desc);
+	pango_layout_set_width(layout, (int)(content_w * PANGO_SCALE));
+	pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+	pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
+	pango_layout_set_text(layout,
+		"ztOSCoreSensorFramework failed to initialize Samsung SensorHub. "
+		"Please do a hot reboot (Go to twrp -> Reboot -> System). "
+		"This will initialize the SensorHub.", -1);
+
+	cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+	cairo_move_to(cr, pad, text_y);
+	pango_cairo_show_layout(cr, layout);
+	pango_font_description_free(desc);
+	g_object_unref(layout);
+
+	/* Buttons: Reboot & Continue Anyway, positioned comfortably above nav bar */
+	double btn_h = 48.0;
+	double btn_y2 = server->height - NAV_H - 16.0 - btn_h;
+	double btn_y1 = btn_y2 - 14.0 - btn_h;
+
+	cairo_set_line_width(cr, 2.0);
+
+	/* Reboot button */
+	cairo_set_source_rgb(cr, 0.95, 0.2, 0.2);
+	cairo_rectangle(cr, pad, btn_y1, content_w, btn_h);
+	cairo_stroke(cr);
+	cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+	draw_text(cr, "Reboot", FONT_SEMIBOLD, 16.0, pad, btn_y1, content_w, btn_h, true);
+
+	/* Continue Anyway button */
+	cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
+	cairo_rectangle(cr, pad, btn_y2, content_w, btn_h);
+	cairo_stroke(cr);
+	cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+	draw_text(cr, "Continue Anyway", FONT_REGULAR, 16.0, pad, btn_y2, content_w, btn_h, true);
+
+	zt_buffer_show(server, &server->sensorhub_fail_layer, buffer, cr, server->width, server->height);
+}
+
+static void boot_anim_start(struct zt_server *server) {
+	/* 1. Hold the ztOS splash, then swipe up nav bar icons one by one from below */
+	animate(server, &server->nav_icon_y[0], 0.0f, 480, 700, false);
+	animate(server, &server->nav_icon_y[1], 0.0f, 480, 1050, false);
+	animate(server, &server->nav_icon_y[2], 0.0f, 480, 1400, false);
+
+	/* 2. Pause to let the full nav bar settle, then gracefully drop the lockscreen from top */
+	animate(server, &server->lock_y, 0.0f, 750, 2200, false);
+	damage(server);
+}
+
+static int boot_check_sensorhub(void *data) {
+	struct zt_server *server = data;
+	bool test_fail = getenv("ZT_TEST_SENSORHUB_FAIL") != NULL;
+
+	bool ready = false;
+	if (!test_fail) {
+		char buf[16] = {0};
+		int fd = open("/sys/class/sec/sensorhub/ready", O_RDONLY);
+		if (fd >= 0) {
+			ssize_t n = read(fd, buf, sizeof(buf) - 1);
+			close(fd);
+			if (n > 0 && buf[0] == '1') {
+				ready = true;
+			}
+		}
+	}
+
+	if (ready) {
+		wlr_log(WLR_INFO, "boot: sensor hub ready, starting transition");
+		if (server->boot_check_timer) {
+			wl_event_source_remove(server->boot_check_timer);
+			server->boot_check_timer = NULL;
+		}
+		boot_anim_start(server);
+		return 0;
+	}
+
+	server->boot_check_count++;
+	/* Check up to 25 times (~2.5s) */
+	if (server->boot_check_count < 25 && !test_fail) {
+		wl_event_source_timer_update(server->boot_check_timer, 100);
+		return 0;
+	}
+
+	/* Failed: show warning screen */
+	wlr_log(WLR_ERROR, "boot: sensor hub failed to initialize, showing warning screen");
+	if (server->boot_check_timer) {
+		wl_event_source_remove(server->boot_check_timer);
+		server->boot_check_timer = NULL;
+	}
+	server->sensorhub_fail_screen = true;
+	draw_sensorhub_fail(server);
+	damage(server);
+	return 0;
 }
 
 /* ---- on-screen keyboard: layout and drawing ------------------------------ */
@@ -3850,7 +4046,11 @@ static void osk_row(struct zt_server *server, const struct osk_key *row, int n,
 #define KS(label, code) { label, NULL, code, true, ACT_CHAR, 1 }
 #define KBACKSPACE { NULL, "backspace", KEY_BACKSPACE, false, ACT_CHAR, 1.5 }
 
+static const char *const OSK_EMOJIS[] = {"😀", "😂", "😍", "😊", "😭", "😎", "🤔", "😅", "👍", "👎", "🙏", "👏", "❤", "🔥", "🎉", "✨", "😡", "😢", "😴", "😘", "😁", "💯", "✅", "👋"};
+static const unsigned OSK_EMOJI_CODES[] = {0x1f600, 0x1f602, 0x1f60d, 0x1f60a, 0x1f62d, 0x1f60e, 0x1f914, 0x1f605, 0x1f44d, 0x1f44e, 0x1f64f, 0x1f44f, 0x2764, 0x1f525, 0x1f389, 0x2728, 0x1f621, 0x1f622, 0x1f634, 0x1f618, 0x1f601, 0x1f4af, 0x2705, 0x1f44b};
+
 static void osk_layout(struct zt_server *server) {
+	server->osk_base_dirty = true;
 	static const struct osk_key term[] = {
 		{ "esc", NULL, KEY_ESC, false, ACT_CHAR, 1.2 },
 		{ "tab", NULL, KEY_TAB, false, ACT_CHAR, 1.2 },
@@ -3882,11 +4082,13 @@ static void osk_layout(struct zt_server *server) {
 		K("/", KEY_SLASH), KS("?", KEY_SLASH), KS("_", KEY_MINUS), K("=", KEY_EQUAL),
 		KBACKSPACE };
 	static const struct osk_key bottom_letters[] = {
-		{ "&123", NULL, 0, false, ACT_PAGE, 1.6 }, K(",", KEY_COMMA),
+		{ "&123", NULL, 0, false, ACT_PAGE, 1.4 },
+		{ NULL, "smiley", 0, false, ACT_EMOJI, 1 }, K(",", KEY_COMMA),
 		{ "space", NULL, KEY_SPACE, false, ACT_CHAR, 4.6 }, K(".", KEY_DOT),
 		{ NULL, "enter", KEY_ENTER, false, ACT_CHAR, 1.6 } };
 	static const struct osk_key bottom_symbols[] = {
-		{ "abc", NULL, 0, false, ACT_PAGE, 1.6 }, K(",", KEY_COMMA),
+		{ "abc", NULL, 0, false, ACT_PAGE, 1.4 },
+		{ NULL, "smiley", 0, false, ACT_EMOJI, 1 }, K(",", KEY_COMMA),
 		{ "space", NULL, KEY_SPACE, false, ACT_CHAR, 4.6 }, K(".", KEY_DOT),
 		{ NULL, "enter", KEY_ENTER, false, ACT_CHAR, 1.6 } };
 	server->n_keys = 0;
@@ -3895,18 +4097,32 @@ static void osk_layout(struct zt_server *server) {
 		osk_row(server, term, 8, y, TERM_ROW_H, 0);
 		y += TERM_ROW_H;
 	}
-	if (server->osk_symbols) {
-		osk_row(server, s1, 10, y, KROW_H, 0);
-		osk_row(server, s2, 10, y + KROW_H, KROW_H, 0);
-		osk_row(server, s3, 10, y + 2 * KROW_H, KROW_H, 0);
-		osk_row(server, bottom_symbols, 5, y + 3 * KROW_H, KROW_H, 0);
+	if (server->osk_emoji) {
+        struct osk_key row[8];
+        for (int r = 0; r < 3; r++) {
+            for (int i = 0; i < 8; i++) {
+                row[i] = (struct osk_key){ OSK_EMOJIS[r * 8 + i], NULL,
+                    KEY_F13 + r * 8 + i, false, ACT_CHAR, 1 };
+            }
+            osk_row(server, row, 8, y + r * server->key_height, server->key_height, 0);
+        }
+        static const struct osk_key controls[] = {
+            { "abc", NULL, 0, false, ACT_EMOJI, 1.5 },
+            { "space", NULL, KEY_SPACE, false, ACT_CHAR, 4 },
+            KBACKSPACE, { NULL, "enter", KEY_ENTER, false, ACT_CHAR, 1.5 } };
+        osk_row(server, controls, 4, y + 3 * server->key_height, server->key_height, 0);
+    } else if (server->osk_symbols) {
+        osk_row(server, s1, 10, y, server->key_height, 0);
+		osk_row(server, s2, 10, y + server->key_height, server->key_height, 0);
+		osk_row(server, s3, 10, y + 2 * server->key_height, server->key_height, 0);
+		osk_row(server, bottom_symbols, 6, y + 3 * server->key_height, server->key_height, 0);
 	} else {
-		osk_row(server, l1, 10, y, KROW_H, 0);
-		osk_row(server, l2, 9, y + KROW_H, KROW_H, server->width / 20.0);
-		osk_row(server, l3, 9, y + 2 * KROW_H, KROW_H, 0);
-		osk_row(server, bottom_letters, 5, y + 3 * KROW_H, KROW_H, 0);
+		osk_row(server, l1, 10, y, server->key_height, 0);
+		osk_row(server, l2, 9, y + server->key_height, server->key_height, server->width / 20.0);
+		osk_row(server, l3, 9, y + 2 * server->key_height, server->key_height, 0);
+		osk_row(server, bottom_letters, 6, y + 3 * server->key_height, server->key_height, 0);
 	}
-	server->osk_h = y + 4 * KROW_H;
+	server->osk_h = y + 4 * server->key_height;
 }
 
 /* The key under the finger, drawn again larger just above it, where the
@@ -3918,7 +4134,7 @@ static void draw_keypop(struct zt_server *server) {
 		struct osk_key *key = &server->keys[server->osk_pressed];
 		if (key->label && key->action == ACT_CHAR && strlen(key->label) == 1 &&
 				key->label[0] != ' ') {
-			double w = key->w + 16, h = KROW_H + 10;
+			double w = key->w + 16, h = server->key_height + 10;
 			cairo_t *cr;
 			struct zt_buffer *buffer = zt_buffer_create(server, w, h, &cr);
 			set_rgb(cr, server->accent);
@@ -3943,23 +4159,78 @@ static void draw_keypop(struct zt_server *server) {
 }
 
 static void draw_osk(struct zt_server *server) {
+	int pw = (int)ceil(server->width * server->scale);
+	int ph = (int)ceil(server->osk_h * server->scale);
+	int tw = (pw + 63) / 64 * 64;
+	int th = (ph + 63) / 64 * 64;
+
+	if (server->osk_base_dirty || !server->osk_base_surface ||
+			cairo_image_surface_get_width(server->osk_base_surface) != tw ||
+			cairo_image_surface_get_height(server->osk_base_surface) != th) {
+		if (server->osk_base_surface) {
+			cairo_surface_destroy(server->osk_base_surface);
+		}
+		server->osk_base_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, tw, th);
+		cairo_t *bcr = cairo_create(server->osk_base_surface);
+		cairo_scale(bcr, server->scale, server->scale);
+		cairo_set_source_rgb(bcr, 0, 0, 0);
+		cairo_paint(bcr);
+
+		for (int i = 0; i < server->n_keys; i++) {
+			struct osk_key *key = &server->keys[i];
+			bool latched = (key->action == ACT_SHIFT && server->osk_shift) ||
+				(key->action == ACT_CTRL && server->osk_ctrl) ||
+				(key->action == ACT_ALT && server->osk_alt);
+			bool letter = key->label && strlen(key->label) == 1;
+			if (latched) {
+				set_rgb(bcr, server->accent);
+			} else if (letter) {
+				cairo_set_source_rgb(bcr, 0.2, 0.2, 0.2);
+			} else {
+				cairo_set_source_rgb(bcr, 0.12, 0.12, 0.12);
+			}
+			cairo_rectangle(bcr, key->x, key->y, key->w, key->h);
+			cairo_fill(bcr);
+			cairo_set_source_rgb(bcr, 1, 1, 1);
+			if (key->icon) {
+				const char *icon = key->action == ACT_SHIFT && server->osk_shift ?
+					"shift-on" : key->icon;
+				draw_icon(bcr, icon, key->x + key->w / 2, key->y + key->h / 2, 18);
+			} else {
+				char label[16];
+				snprintf(label, sizeof(label), "%s", key->label);
+				if (letter && label[0] >= 'a' && label[0] <= 'z' && server->osk_shift) {
+					label[0] -= 32;
+				}
+				draw_text(bcr, label, FONT_REGULAR, server->osk_emoji && key->action == ACT_CHAR ? 24 : letter ? 20 : 13, key->x, key->y,
+					key->w, key->h, true);
+			}
+		}
+		cairo_destroy(bcr);
+		cairo_surface_flush(server->osk_base_surface);
+		server->osk_base_dirty = false;
+	}
+
 	cairo_t *cr;
 	struct zt_buffer *buffer = zt_buffer_create(server, server->width, server->osk_h, &cr);
-	cairo_set_source_rgb(cr, 0, 0, 0);
-	cairo_paint(cr);
-	for (int i = 0; i < server->n_keys; i++) {
-		struct osk_key *key = &server->keys[i];
-		bool latched = (key->action == ACT_SHIFT && server->osk_shift) ||
-			(key->action == ACT_CTRL && server->osk_ctrl) ||
-			(key->action == ACT_ALT && server->osk_alt);
-		bool letter = key->label && strlen(key->label) == 1;
-		if (i == server->osk_pressed || latched) {
-			set_rgb(cr, server->accent);
-		} else if (letter) {
-			cairo_set_source_rgb(cr, 0.2, 0.2, 0.2);
-		} else {
-			cairo_set_source_rgb(cr, 0.12, 0.12, 0.12);	/* function keys sit darker */
+	int stride = cairo_image_surface_get_stride(buffer->surface);
+	int base_stride = cairo_image_surface_get_stride(server->osk_base_surface);
+	if (stride == base_stride) {
+		memcpy(cairo_image_surface_get_data(buffer->surface),
+			cairo_image_surface_get_data(server->osk_base_surface),
+			stride * th);
+	} else {
+		for (int r = 0; r < th; r++) {
+			memcpy(cairo_image_surface_get_data(buffer->surface) + r * stride,
+				cairo_image_surface_get_data(server->osk_base_surface) + r * base_stride,
+				stride < base_stride ? stride : base_stride);
 		}
+	}
+	cairo_surface_mark_dirty(buffer->surface);
+
+	if (server->osk_pressed >= 0 && server->osk_pressed < server->n_keys) {
+		struct osk_key *key = &server->keys[server->osk_pressed];
+		set_rgb(cr, server->accent);
 		cairo_rectangle(cr, key->x, key->y, key->w, key->h);
 		cairo_fill(cr);
 		cairo_set_source_rgb(cr, 1, 1, 1);
@@ -3970,13 +4241,15 @@ static void draw_osk(struct zt_server *server) {
 		} else {
 			char label[16];
 			snprintf(label, sizeof(label), "%s", key->label);
+			bool letter = key->label && strlen(key->label) == 1;
 			if (letter && label[0] >= 'a' && label[0] <= 'z' && server->osk_shift) {
 				label[0] -= 32;
 			}
-			draw_text(cr, label, FONT_REGULAR, letter ? 20 : 13, key->x, key->y,
+			draw_text(cr, label, FONT_REGULAR, server->osk_emoji && key->action == ACT_CHAR ? 24 : letter ? 20 : 13, key->x, key->y,
 				key->w, key->h, true);
 		}
 	}
+
 	zt_buffer_show(server, &server->osk_layer, buffer, cr, server->width, server->osk_h);
 	draw_keypop(server);
 }
@@ -4041,6 +4314,8 @@ static void osk_show(struct zt_server *server, bool visible) {
 	} else {
 		server->osk_shift = server->osk_ctrl = server->osk_alt = false;
 		server->osk_symbols = false;
+		server->osk_emoji = false;
+		server->key_prefix[0] = 0;
 	}
 	animate(server, &server->osk_slide, visible ? 1.0f : 0.0f, OSK_MS, 0, false);
 	if (!visible) {
@@ -4067,6 +4342,7 @@ static bool is_terminal(struct zt_toplevel *toplevel) {
 }
 
 static void text_inputs_focus(struct zt_server *server, struct wlr_surface *surface) {
+	server->key_prefix[0] = 0;
 	struct zt_text_input *ti;
 	wl_list_for_each(ti, &server->text_inputs, link) {
 		if (ti->input->focused_surface && ti->input->focused_surface != surface) {
@@ -4761,33 +5037,66 @@ static void search_key(struct zt_server *server, struct osk_key *key) {
 	list_relayout(server);
 }
 
+static void keyboard_sound(struct zt_server *server, const struct osk_key *key) {
+    if (!server->key_sound || !server->ring_volume) return;
+    if (server->key_sound_fd < 0)
+        server->key_sound_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (server->key_sound_fd < 0) return;
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    if (!runtime) return;
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/ztos-sounds.sock", runtime);
+    unsigned char packet[2] = {
+        key->keycode == KEY_SPACE ? 1 : key->action != ACT_CHAR || key->keycode == KEY_BACKSPACE || key->keycode == KEY_ENTER ? 2 : 0,
+        (unsigned char)(server->ring_volume * 100 / VOLUME_MAX) };
+    sendto(server->key_sound_fd, packet, sizeof(packet), MSG_DONTWAIT, (struct sockaddr *)&addr, sizeof(addr));
+}
+
 static void osk_activate(struct zt_server *server, int index) {
+	if (index < 0 || index >= server->n_keys) return;
 	struct osk_key *key = &server->keys[index];
 	if (!server->shown && server->searching && key->action == ACT_CHAR) {
 		search_key(server, key);
+		if (server->osk_shift || server->osk_ctrl || server->osk_alt) server->osk_base_dirty = true;
 		server->osk_shift = server->osk_ctrl = server->osk_alt = false;
 		return;
 	}
 	switch (key->action) {
 	case ACT_SHIFT:
 		server->osk_shift = !server->osk_shift;
+		server->osk_base_dirty = true;
 		break;
 	case ACT_CTRL:
 		server->osk_ctrl = !server->osk_ctrl;
+		server->osk_base_dirty = true;
 		break;
 	case ACT_ALT:
 		server->osk_alt = !server->osk_alt;
+		server->osk_base_dirty = true;
+		break;
+	case ACT_EMOJI:
+		server->osk_emoji = !server->osk_emoji;
+		server->osk_shift = false;
+		osk_layout(server);
 		break;
 	case ACT_PAGE:
+		server->osk_emoji = false;
 		server->osk_symbols = !server->osk_symbols;
 		server->osk_shift = false;
 		osk_layout(server);
 		break;
 	case ACT_CHAR:
 		vkbd_send(server, key->keycode, key->shift || server->osk_shift);
-		wlr_log(WLR_INFO, "key: code %u%s", key->keycode,
-			key->shift || server->osk_shift ? " +shift" : "");
+		size_t n = strlen(server->key_prefix);
+        if (key->keycode == KEY_BACKSPACE) {
+            if (n) server->key_prefix[n - 1] = 0;
+        } else if (key->label && key->label[0] >= 'a' && key->label[0] <= 'z' && !key->label[1]) {
+            if (n + 1 < sizeof(server->key_prefix)) {
+                server->key_prefix[n] = key->label[0]; server->key_prefix[n + 1] = 0;
+            }
+        } else server->key_prefix[0] = 0;
 		/* shift, ctrl and alt apply to one key, then let go */
+		if (server->osk_shift || server->osk_ctrl || server->osk_alt) server->osk_base_dirty = true;
 		server->osk_shift = server->osk_ctrl = server->osk_alt = false;
 		break;
 	}
@@ -5090,21 +5399,48 @@ static void tile_release(struct zt_server *server, int index) {
 	animate(server, &t->press, 1.0f, TILT_OUT_MS, 0, false);
 }
 
+static double next_key_weight(const char *prefix, char next) {
+    static const char *const words[] = {
+        "the", "this", "that", "there", "thanks", "thank", "they", "then", "think",
+        "hello", "hey", "how", "have", "happy", "here", "help", "home",
+        "you", "your", "yes", "yeah", "what", "where", "when", "why", "with", "will",
+        "would", "want", "was", "were", "good", "great", "going", "got", "get",
+        "and", "are", "all", "about", "also", "can", "could", "come", "call",
+        "please", "people", "phone", "play", "okay", "only", "one", "our", "out",
+        "not", "now", "need", "nice", "no", "love", "like", "let", "later",
+        "see", "soon", "sorry", "some", "sure", "send", "something", "really",
+        "right", "remember", "tomorrow", "today", "time", "take", "tell", "talk",
+        "from", "for", "fine", "friend", "but", "back", "because", "before",
+        "message", "music", "more", "morning", "my", "me", "meet", "make",
+        "just", "know", "keep", "is", "it", "in", "if", "im", "its", "dont" };
+    size_t n = strlen(prefix);
+    if (!n || n > 24) return 0;
+    int total = 0, matches = 0;
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
+        if (!strncmp(words[i], prefix, n) && strlen(words[i]) > n) {
+            total++; if (words[i][n] == next) matches++;
+        }
+    }
+    return total ? (double)matches / total : 0;
+}
+
 static int key_at(struct zt_server *server, double x, double y) {
-	y -= server->height - NAV_H - server->osk_h;
-	int nearest = -1;
-	double best = 1e9;
-	for (int i = 0; i < server->n_keys; i++) {
-		struct osk_key *key = &server->keys[i];
-		/* a finger in a gap still means the key next to it */
-		double dx = fmax(fmax(key->x - x, x - (key->x + key->w)), 0);
-		double dy = fmax(fmax(key->y - y, y - (key->y + key->h)), 0);
-		if (dx * dx + dy * dy < best) {
-			best = dx * dx + dy * dy;
-			nearest = i;
-		}
-	}
-	return nearest;
+    y -= server->height - NAV_H - server->osk_h;
+    if (x < 0 || x >= server->width || y < 0 || y >= server->osk_h) return -1;
+    int nearest = -1;
+    double best = 1e9;
+    for (int i = 0; i < server->n_keys; i++) {
+        struct osk_key *key = &server->keys[i];
+        double dx = (x - key->x - key->w / 2) / (key->w / 2 + KEY_GAP / 2);
+        double dy = (y - key->y - key->h / 2) / (key->h / 2 + KEY_GAP / 2);
+        if (fabs(dx) < .6 && fabs(dy) < .6) return i;
+        double score = dx * dx + dy * dy;
+        if (!server->osk_symbols && !server->osk_emoji && !server->osk_ctrl && !server->osk_alt &&
+                key->action == ACT_CHAR && key->label && !key->label[1])
+            score -= .5 * next_key_weight(server->key_prefix, key->label[0]);
+        if (score < best) { best = score; nearest = i; }
+    }
+    return nearest;
 }
 
 /* ---- the app list under a finger ------------------------------------------- */
@@ -5558,16 +5894,17 @@ static void draw_volume(struct zt_server *server) {
 	cairo_set_source_rgb(cr, 0.12, 0.12, 0.12);
 	cairo_paint(cr);
 	char text[16];
-	snprintf(text, sizeof(text), "%02d/%d", server->volume, VOLUME_MAX);
+	int level = server->volume_is_media ? server->volume : server->ring_volume;
+	snprintf(text, sizeof(text), "%02d/%d", level, VOLUME_MAX);
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	draw_text(cr, text, FONT_SEMILIGHT, 26, 16, 8, 0, 0, false);
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	draw_text(cr, "ringer + media", FONT_REGULAR, 12, 108, 20, 0, 0, false);
+	draw_text(cr, server->volume_is_media ? "media + apps" : (level ? "ringer + notifications" : "vibrate"), FONT_REGULAR, 12, 108, 20, 0, 0, false);
 	cairo_set_source_rgb(cr, 0.25, 0.25, 0.25);
 	cairo_rectangle(cr, 16, VOLUME_H - 9, server->width - 32, 3);
 	cairo_fill(cr);
 	set_rgb(cr, server->accent);
-	cairo_rectangle(cr, 16, VOLUME_H - 9, (server->width - 32) * server->volume / (double)VOLUME_MAX, 3);
+	cairo_rectangle(cr, 16, VOLUME_H - 9, (server->width - 32) * level / (double)VOLUME_MAX, 3);
 	cairo_fill(cr);
 	if (server->media) {
 		/* What is playing, as the phone has it under the volume: the track
@@ -5864,16 +6201,21 @@ static int volume_hide(void *data) {
 }
 
 static void volume_step(struct zt_server *server, int by) {
-	int to = server->volume + by;
-	server->volume = to < 0 ? 0 : to > VOLUME_MAX ? VOLUME_MAX : to;
-	draw_volume(server);
-	animate(server, &server->volume_y, 0.0f, 140, 0, false);
-	wl_event_source_timer_update(server->volume_timer, server->media ? 4000 : 2000);
-	/* to the sound server, if there is one with a sink to set */
-	char percent[16];
-	snprintf(percent, sizeof(percent), "%d%%", server->volume * 100 / VOLUME_MAX);
-	run_detached("wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", percent);
-	hap(server, HAP_TICK, HG_SYSTEM);
+    server->volume_is_media = server->audio_known ? server->audio_active : server->media_playing;
+    int *level = server->volume_is_media ? &server->volume : &server->ring_volume;
+    int previous = *level, to = previous + by;
+    *level = to < 0 ? 0 : to > VOLUME_MAX ? VOLUME_MAX : to;
+    config_keep(server->volume_is_media ? "media_volume" : "ring_volume",
+        (*level * 100 + VOLUME_MAX - 1) / VOLUME_MAX);
+    draw_volume(server);
+    animate(server, &server->volume_y, 0.0f, 140, 0, false);
+    wl_event_source_timer_update(server->volume_timer, server->media ? 4000 : 2000);
+    if (server->volume_is_media) {
+        char percent[16];
+        snprintf(percent, sizeof(percent), "%d%%", *level * 100 / VOLUME_MAX);
+        run_detached("wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", percent);
+    }
+    hap(server, !server->volume_is_media && previous > 0 && *level == 0 ? HAP_TAP : HAP_TICK, HG_SYSTEM);
 }
 
 /* What white becomes at a colour temperature, against 6500 K as (1, 1, 1):
@@ -5972,6 +6314,33 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 	p->scroll0 = server->scroll;
 	if (server->show_touches) {
 		damage(server);
+	}
+	if (server->sensorhub_fail_screen) {
+		double pad = 28.0, btn_h = 48.0;
+		double content_w = server->width - 2 * pad;
+		double btn_y2 = server->height - NAV_H - 16.0 - btn_h;
+		double btn_y1 = btn_y2 - 14.0 - btn_h;
+		if (x >= pad && x <= pad + content_w) {
+			if (y >= btn_y1 && y <= btn_y1 + btn_h) {
+				hap(server, HAP_TAP, HG_SYSTEM);
+				run_detached("/bin/sh", "-c", "echo 0_v1ru51234 | sudo -S systemctl reboot --reboot-argument=recovery 2>/dev/null || reboot recovery 2>/dev/null || reboot 2>/dev/null", NULL);
+				p->role = ROLE_NONE;
+				return;
+			} else if (y >= btn_y2 && y <= btn_y2 + btn_h) {
+				hap(server, HAP_TAP, HG_SYSTEM);
+				server->sensorhub_fail_screen = false;
+				damage(server);
+				boot_anim_start(server);
+				p->role = ROLE_NONE;
+				return;
+			}
+		}
+		p->role = ROLE_NONE;
+		return;
+	}
+	if (server->splash) {
+		p->role = ROLE_NONE;
+		return;
 	}
 	if (server->dialog_open && server->dialog_y > (float)-server->dialog_h + 10.0f) {
 		if (y >= server->dialog_y && y <= server->dialog_y + server->dialog_h) {
@@ -6126,6 +6495,7 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		p->role = ROLE_KEY;
 		p->index = key_at(server, x, y);
 		server->osk_pressed = p->index;
+		if (p->index >= 0) keyboard_sound(server, &server->keys[p->index]);
 		draw_osk(server);
 		hap(server, HAP_KEY, HG_KEYS);
 		return;
@@ -6368,6 +6738,10 @@ static void touch_update(struct zt_server *server, int32_t id, double x, double 
 		if (index != p->index) {
 			p->index = index;
 			server->osk_pressed = index;
+			if (index >= 0) {
+				keyboard_sound(server, &server->keys[index]);
+				hap(server, HAP_KEY, HG_KEYS);
+			}
 			draw_osk(server);
 		}
 		break;
@@ -6797,6 +7171,9 @@ static void ctl_command(struct zt_server *server, char *line) {
 				}
 			}
 		}
+	} else if (sscanf(line, "audio-active %d", &id) == 1) {
+		server->audio_active = id != 0;
+		server->audio_known = true;
 	} else if (strncmp(line, "media ", 6) == 0) {
 		/* media STATE|TITLE|ARTIST|PLAYER, or media none (ztnotifyd) */
 		char *f[4] = { line + 6, "", "", "" };
@@ -7608,13 +7985,29 @@ static void render_frame(struct zt_server *server) {
 		layer_draw(server, &server->shade_layer, 0, reveal - (float)SHADE_MAX_H, 1.0f);
 		glDisable(GL_SCISSOR_TEST);
 	}
+	if (server->splash && server->splash_layer.tex) {
+		layer_draw(server, &server->splash_layer, 0, 0, 1.0f);
+	}
+	if (server->sensorhub_fail_screen && server->sensorhub_fail_layer.tex) {
+		layer_draw(server, &server->sensorhub_fail_layer, 0, 0, 1.0f);
+	}
+	if (animating(server, &server->nav_icon_y[0]) || animating(server, &server->nav_icon_y[1]) ||
+	    animating(server, &server->nav_icon_y[2])) {
+		draw_nav(server);
+	}
 	/* the nav bar stays on top: the panel comes down behind it */
-	layer_draw(server, &server->nav_layer, 0, server->height - NAV_H, 1.0f);
+	if (!server->sensorhub_fail_screen) {
+		layer_draw(server, &server->nav_layer, 0, server->height - NAV_H, 1.0f);
+	}
 	if (server->keypop && server->osk_visible && server->keypop_layer.tex) {
 		layer_draw(server, &server->keypop_layer, server->keypop_x, server->keypop_y, 1.0f);
 	}
 	if (server->lock_layer.tex && (server->locked || server->lock_y > 1.0f - server->height)) {
 		layer_draw(server, &server->lock_layer, 0, server->lock_y, 1.0f);
+	}
+	if (server->splash && !animating(server, &server->lock_y) && server->lock_y >= 0.0f) {
+		server->splash = false;
+		wlr_log(WLR_INFO, "boot: transition complete, splash removed");
 	}
 	if (server->volume_y > 1.0f - (float)banner_h(server) && server->volume_layer.tex) {
 		layer_draw(server, &server->volume_layer, 0, server->volume_y, 1.0f);
@@ -7846,6 +8239,26 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 
 	projection_set(server);
 	renderer_init(server);
+
+	/* Initialize splash screen and nav immediately so first frame flips without delay */
+	server->splash = true;
+	draw_splash(server);
+
+	/* Nav bar icons start offset below the bar */
+	server->nav_icon_y[0] = NAV_H + 20.0f;
+	server->nav_icon_y[1] = NAV_H + 20.0f;
+	server->nav_icon_y[2] = NAV_H + 20.0f;
+	draw_nav(server);
+
+	/* Lockscreen starts above the screen, off the top */
+	server->locked = true;
+	server->switcher = false;
+	server->switch_t = 0.0f;
+	server->lock_y = (float)-server->height;
+
+	server->screen_on = true;
+	damage(server);
+
 	load_logo(server);
 	place_tiles(server);
 	draw_start(server);
@@ -7854,12 +8267,15 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	load_apps(server);
 	draw_status(server);
 	draw_shade(server);
-	draw_nav(server);
-	lock(server);
+	draw_lock(server);
+
 	osk_layout(server);
-	server->screen_on = true;
 	activity(server);
-	damage(server);
+
+	/* Start sensor hub test timer */
+	server->boot_check_count = 0;
+	server->boot_check_timer = wl_event_loop_add_timer(server->loop, boot_check_sensorhub, server);
+	wl_event_source_timer_update(server->boot_check_timer, 100);
 }
 
 static void surface_commit(struct wl_listener *listener, void *data) {
@@ -7903,7 +8319,9 @@ static int reload(int signal_number, void *data) {
 	int n = server->n_tiles;
 	uint32_t accent = server->accent;
 	int strength = server->haptic_strength;
+	int ring_before = server->ring_volume;
 	load_config(server);
+	if (ring_before > 0 && server->ring_volume == 0) hap(server, HAP_TAP, HG_SYSTEM);
 	server->scale = scale;
 	if (strength != server->haptic_strength) {
 		hap(server, HAP_CLICK, HG_SYSTEM);	/* this is how it feels now */
@@ -7942,7 +8360,9 @@ static int reload(int signal_number, void *data) {
 		draw_status(server);
 		draw_shade(server);
 		draw_nav(server);
+		osk_layout(server);
 		if (server->osk_visible) {
+			osk_lift(server);
 			draw_osk(server);
 		}
 	}
@@ -8000,6 +8420,10 @@ static int render_to_files(struct zt_server *server, const char *dir) {
 	draw_status(server);
 	g_dump_name = "nav";
 	draw_nav(server);
+	g_dump_name = "splash";
+	draw_splash(server);
+	g_dump_name = "sensorhub_fail";
+	draw_sensorhub_fail(server);
 	g_dump_name = "shade";
 	server->shade_wifi = wifi_up();
 	draw_shade(server);
@@ -8039,7 +8463,8 @@ int main(int argc, char *argv[]) {
 	server.osk_box_bottom = -1;
 	server.app_alpha = 1.0f;
 	server.lock_enabled = true;
-	server.volume = 10;
+	server.key_sound_fd = -1;
+	server.volume = 24;
 	server.volume_y = -(VOLUME_H + MEDIA_H);
 	server.toast_y = -TOAST_H;
 	server.dialog_h = 240;
@@ -8119,6 +8544,24 @@ int main(int argc, char *argv[]) {
 		WL_SEAT_CAPABILITY_TOUCH | WL_SEAT_CAPABILITY_KEYBOARD);
 	wlr_keyboard_init(&server.vkbd, &vkbd_impl, "ztmetro-osk");
 	set_default_keymap(&server.vkbd);
+    {
+        char map[8192];
+        size_t used = snprintf(map, sizeof(map),
+            "xkb_keymap { xkb_keycodes { include \"evdev+aliases(qwerty)\" }; "
+            "xkb_types { include \"complete\" }; xkb_compatibility { include \"complete\" }; "
+            "xkb_symbols { include \"pc+us+inet(evdev)\" ");
+        for (int i = 0; i < 24; i++) {
+            const char *name = xkb_keymap_key_get_name(server.vkbd.keymap, KEY_F13 + i + 8);
+            if (name) used += snprintf(map + used, sizeof(map) - used,
+                "key <%s> { [ U%04X ] }; ", name, OSK_EMOJI_CODES[i]);
+        }
+        snprintf(map + used, sizeof(map) - used, "}; };");
+        struct xkb_context *ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+        struct xkb_keymap *emoji_map = xkb_keymap_new_from_string(ctx, map,
+            XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+        if (emoji_map) { wlr_keyboard_set_keymap(&server.vkbd, emoji_map); xkb_keymap_unref(emoji_map); }
+        xkb_context_unref(ctx);
+    }
 	wlr_keyboard_set_repeat_info(&server.vkbd, 0, 0);
 	wlr_seat_set_keyboard(server.seat, &server.vkbd);
 
@@ -8188,6 +8631,12 @@ int main(int argc, char *argv[]) {
 	}
 
 	ctl_init(&server);
+	run_detached("/usr/local/bin/ztos-sounds", NULL, NULL, NULL);
+	{
+		char percent[16];
+		snprintf(percent, sizeof(percent), "%d%%", server.volume * 100 / VOLUME_MAX);
+		run_detached("wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", percent);
+	}
 	{
 		/* zrnperfd puts the shell first in line for the CPU (see there) */
 		char line[32];

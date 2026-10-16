@@ -3,6 +3,7 @@
 
 # the system
 base
+e2fsprogs
 sudo
 polkit
 networkmanager
@@ -13,6 +14,7 @@ xdg-user-dirs
 alsa-utils
 brightnessctl
 pipewire
+rtkit
 pipewire-pulse
 pipewire-alsa
 wireplumber
@@ -31,6 +33,8 @@ pixman
 gdk-pixbuf2
 playerctl
 noto-fonts
+noto-fonts-emoji
+libpulse
 ttf-dejavu
 
 # to build ztMETRO and its apps inside the image (and for developers after)
@@ -44,6 +48,11 @@ pyside6
 qt6-svg
 
 # prebuilt apps
+yt-dlp
+mpv
+cava
+nodejs
+npm
 firefox
 chromium
 gnome-terminal

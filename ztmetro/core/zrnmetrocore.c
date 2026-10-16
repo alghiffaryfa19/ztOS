@@ -20,6 +20,7 @@
 
 #include <pango/pangocairo.h>
 #include <wayland-client.h>
+#include <xkbcommon/xkbcommon.h>
 
 #include "xdg-shell-client-protocol.h"
 #include "viewporter-client-protocol.h"
@@ -1837,6 +1838,9 @@ static const struct wl_touch_listener touch_listener = {
 };
 
 static bool key_shift;
+static struct xkb_context *key_context;
+static struct xkb_keymap *key_map;
+static struct xkb_state *key_state;
 
 /* What a key types, by its code: the shell's keyboard sends real key presses
  * of a US layout, with shift held for capitals and the upper symbols. */
@@ -1868,7 +1872,16 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
 		zmc_back();
 		return;
 	}
-	const char *typed = zmc.app->text ? key_text(key, key_shift) : NULL;
+	char utf8[64];
+    const char *typed = NULL;
+    if (zmc.app->text) {
+        if (key == KEY_BACKSPACE || key == KEY_ENTER || !key_state) {
+            typed = key_text(key, key_shift);
+        } else {
+            int n = xkb_state_key_get_utf8(key_state, key + 8, utf8, sizeof(utf8));
+            if (n > 0 && n < (int)sizeof(utf8)) typed = utf8;
+        }
+    }
 	if (typed) {
 		zmc.app->text(typed);
 		zmc_redraw();
@@ -1877,7 +1890,20 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
 
 static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t format,
 		int32_t fd, uint32_t size) {
-	close(fd);
+    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || !size) { close(fd); return; }
+    char *map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return;
+    if (!key_context) key_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    struct xkb_keymap *next = key_context ? xkb_keymap_new_from_buffer(key_context,
+        map, size - 1, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS) : NULL;
+    munmap(map, size);
+    if (!next) return;
+    struct xkb_state *state = xkb_state_new(next);
+    if (!state) { xkb_keymap_unref(next); return; }
+    xkb_state_unref(key_state);
+    xkb_keymap_unref(key_map);
+    key_map = next; key_state = state;
 }
 static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
 		struct wl_surface *surface, struct wl_array *keys) {}
@@ -1886,6 +1912,7 @@ static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t se
 static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial,
 		uint32_t mods_depressed, uint32_t mods_latched, uint32_t mods_locked,
 		uint32_t group) {
+	if (key_state) xkb_state_update_mask(key_state, mods_depressed, mods_latched, mods_locked, 0, 0, group);
 	key_shift = ((mods_depressed | mods_latched | mods_locked) & 3) != 0;	/* shift or caps lock */
 }
 static void keyboard_repeat_info(void *data, struct wl_keyboard *keyboard, int32_t rate,
@@ -2629,6 +2656,10 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 		}
 	}
 	zmg_fini();
+	xkb_state_unref(key_state);
+	xkb_keymap_unref(key_map);
+	xkb_context_unref(key_context);
+	key_state = NULL; key_map = NULL; key_context = NULL;
 	wl_display_disconnect(zmc.display);
 	return 0;
 }

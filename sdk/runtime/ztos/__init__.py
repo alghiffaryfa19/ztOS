@@ -35,24 +35,25 @@ from typing import Callable, Iterable, Optional, Union
 
 from PySide6.QtCore import (QByteArray, QEasingCurve, QEvent, QObject, QPoint, QPointF, QRect, QRectF, Qt, QTimer,
                             QVariantAnimation, SIGNAL, Signal)
-from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication, QPainter, QPainterPath, QPen,
+from PySide6.QtGui import (QColor, QFont, QFontDatabase, QFontMetricsF, QGuiApplication, QPainter, QPainterPath, QPen,
                            QImage, QPixmap, QRegion, QTransform)
 from PySide6.QtWidgets import (QAbstractButton, QAbstractSlider, QAbstractSpinBox, QPlainTextEdit, QTextEdit,
                                QApplication, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QSizePolicy, QStackedLayout, QVBoxLayout, QWidget)
 
 __all__ = [
-    "App", "Page", "Pivot", "Entry", "Toggle", "Slider", "TextBox", "RoundButton", "AppBar",
+    "App", "Page", "Pivot", "Entry", "Toggle", "Slider", "SeekBar", "TextBox", "RoundButton", "AppBar",
     "menu", "haptic", "notify", "osk", "accent", "resource", "load_ui", "on_device", "manifest",
-    "MARGIN", "FONT_LIGHT", "FONT_SEMILIGHT", "FONT_REGULAR", "FONT_SEMIBOLD",
+    "MARGIN", "FONT_LIGHT", "FONT_SEMILIGHT", "FONT_REGULAR", "FONT_SEMIBOLD", "FONT_SYMBOLIC",
     "ProgressBar", "LoadingDots", "Dialog", "message", "performance", "battery", "launch", "store", "Store",
 ]
 
 MARGIN = 16
-FONT_LIGHT = ["Segoe WP Light", "Selawik Light", "Selawik", "Open Sans Light", "sans-serif"]
-FONT_SEMILIGHT = ["Segoe WP Semilight", "Selawik Semilight", "Selawik", "Open Sans", "sans-serif"]
-FONT_REGULAR = ["Segoe WP", "Selawik", "Open Sans", "sans-serif"]
-FONT_SEMIBOLD = ["Segoe WP Semibold", "Selawik Semibold", "Selawik", "Open Sans Semibold", "sans-serif"]
+FONT_LIGHT = ["Segoe UI Light", "Selawik Light", "Selawik", "Open Sans Light", "sans-serif"]
+FONT_SEMILIGHT = ["Segoe UI Semilight", "Selawik Semilight", "Selawik", "Open Sans", "sans-serif"]
+FONT_REGULAR = ["Segoe UI", "Selawik", "Open Sans", "sans-serif"]
+FONT_SEMIBOLD = ["Segoe UI Semibold", "Selawik Semibold", "Selawik", "Open Sans Semibold", "sans-serif"]
+FONT_SYMBOLIC = ["Segoe MDL2 Assets", "Segoe UI Symbol", "sans-serif"]
 GREY = QColor(153, 153, 153)        # details under titles
 DIM = QColor(97, 97, 97)            # the next pivot titles
 
@@ -528,7 +529,7 @@ class _Finger(QObject):
         self.moved = False
         self.axis = 0
         self.active = True
-        self.passive = isinstance(obj, (Slider, QAbstractSlider)) or (self.page is None and self.pivot is None)
+        self.passive = isinstance(obj, (Slider, SeekBar, QAbstractSlider)) or (self.page is None and self.pivot is None)
         self.app.last_press_y = self.app.window.mapFromGlobal(at).y()
         self.held_focus = None
         typing = _ancestor(obj, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox))
@@ -592,7 +593,14 @@ class _Finger(QObject):
             typing.setFocusPolicy(policy)
             if not self.moved and typing.rect().contains(typing.mapFromGlobal(at).toPoint()):
                 typing.setFocus(Qt.MouseFocusReason)
-        if self.passive or not self.moved:
+        if self.passive:
+            return False
+        if not self.moved:
+            # The page may have entered the GPU scroll path during a preceding
+            # drag/fling. A fresh touch can settle it without crossing slop;
+            # always put the live widget tree back when the finger is released.
+            if self.page is not None:
+                self.page._gl_end()
             return False
         recent = event.timestamp() - self.last_ms <= 80
         if self.axis == 1:
@@ -741,6 +749,7 @@ class _Pressable(QWidget):
             return
         if self._flat is None:
             self._flat = self._make_flat()
+        _solid(layer, ("sys", "black"), QColor("black"))
         layer.upload(("lean", id(self)), self._flat)
         self._gl_lean = layer.begin(("lean", id(self)), self.window().rect(), self._lean_quads)
 
@@ -774,7 +783,9 @@ class _Pressable(QWidget):
             return w / 2 + eye * cy_ * X / den, h / 2 + eye * cx_ * Y / den
         key = ("lean", id(self))
         fw, fh = float(self._flat.width()), float(self._flat.height())
-        quads = []
+        # The subsurface is transparent: erase the original row before drawing
+        # its transformed copy, otherwise both sets of text remain visible.
+        quads = [Quad.rect(("sys", "black"), _WHOLE, ox, oy, w, h)]
         nx, ny = 10, 3
         for i in range(nx):
             for j in range(ny):
@@ -1087,6 +1098,122 @@ class Slider(QWidget):
         p.fillRect(QRectF(min(max(fill - 5, 0), w - 10), track - 7, 10, 18), QColor("white"))
 
 
+class SeekBar(QWidget):
+    """A media seek bar: current position and total duration timestamps over a scrubbable track."""
+    seeking = Signal(float)     # while scrubbing (seconds)
+    seeked = Signal(float)      # when released (seconds)
+    changed = Signal(float)     # alias for seeked
+
+    def __init__(self, position: float = 0.0, duration: float = 0.0,
+                 on_seek: Optional[Callable[[float], None]] = None, parent=None):
+        super().__init__(parent)
+        self._position = max(0.0, float(position))
+        self._duration = max(0.0, float(duration))
+        self._buffered = 0.0
+        self._is_seeking = False
+        self._scrub_pos = 0.0
+        self.setFixedHeight(46)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        if on_seek:
+            self.seeked.connect(on_seek)
+
+    def position(self) -> float:
+        return self._position
+
+    def duration(self) -> float:
+        return self._duration
+
+    def set_position(self, pos: float):
+        if not self._is_seeking:
+            self._position = max(0.0, float(pos))
+            self.update()
+
+    def set_duration(self, dur: float):
+        self._duration = max(0.0, float(dur))
+        self.update()
+
+    def set_buffered(self, buf: float):
+        self._buffered = max(0.0, min(self._duration, float(buf)))
+        self.update()
+
+    @staticmethod
+    def format_time(seconds: float) -> str:
+        s = int(max(0.0, seconds))
+        m, s = divmod(s, 60)
+        h, m = divmod(m, 60)
+        if h > 0:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def _x_to_time(self, x: float) -> float:
+        w = max(1.0, float(self.width()))
+        frac = _clamp01(x / w)
+        return frac * self._duration
+
+    def mousePressEvent(self, event):
+        self._is_seeking = True
+        haptic("tick")
+        self._scrub_pos = self._x_to_time(event.position().x())
+        self.seeking.emit(self._scrub_pos)
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._is_seeking:
+            self._scrub_pos = self._x_to_time(event.position().x())
+            self.seeking.emit(self._scrub_pos)
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self._is_seeking:
+            self._is_seeking = False
+            self._position = self._scrub_pos
+            haptic("tap")
+            self.seeked.emit(self._position)
+            self.changed.emit(self._position)
+            self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
+        w = float(self.width())
+        cur_time = self._scrub_pos if self._is_seeking else self._position
+        cur_str = self.format_time(cur_time)
+        dur_str = self.format_time(self._duration)
+
+        # Timestamps on top
+        p.setPen(QColor(220, 220, 220) if self._is_seeking else GREY)
+        p.setFont(_font(FONT_SEMILIGHT, 12))
+        fm = QFontMetricsF(p.font())
+        p.drawText(QPointF(0, fm.ascent()), cur_str)
+        p.setPen(GREY)
+        p.drawText(QPointF(w - fm.horizontalAdvance(dur_str), fm.ascent()), dur_str)
+
+        # Track bar
+        track_y = 28.0
+        track_h = 4.0
+        p.fillRect(QRectF(0, track_y, w, track_h), QColor(56, 56, 56))
+
+        # Buffered segment
+        if self._duration > 0 and self._buffered > 0:
+            buf_w = w * min(1.0, self._buffered / self._duration)
+            p.fillRect(QRectF(0, track_y, buf_w, track_h), QColor(85, 85, 85))
+
+        # Played progress
+        fill_w = 0.0
+        if self._duration > 0:
+            fill_w = w * min(1.0, cur_time / self._duration)
+            p.fillRect(QRectF(0, track_y, fill_w, track_h), accent())
+
+        # Scrubber thumb
+        thumb_w = 12.0 if self._is_seeking else 10.0
+        thumb_h = 22.0 if self._is_seeking else 18.0
+        thumb_x = min(max(fill_w - thumb_w / 2.0, 0.0), w - thumb_w)
+        thumb_y = track_y + (track_h - thumb_h) / 2.0
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("white"))
+        p.drawRect(QRectF(thumb_x, thumb_y, thumb_w, thumb_h))
+
+
 class _Field(QLineEdit):
     def __init__(self, *args):
         super().__init__(*args)
@@ -1216,6 +1343,21 @@ class RoundButton(_Pressable):
         if on_tap:
             self.tapped.connect(on_tap)
 
+    def set_glyph(self, glyph: str):
+        if self._glyph != glyph:
+            self._glyph = glyph
+            self._svg = None
+            if glyph.endswith(".svg"):
+                from PySide6.QtSvg import QSvgRenderer
+                self._svg = QSvgRenderer(QByteArray(resource(glyph)))
+            self.update()
+
+    def set_label(self, label: str):
+        if self._label != label:
+            self._label = label
+            self.setFixedSize(68, 74 if label else 52)
+            self.update()
+
     def draw(self, p: QPainter):
         p.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
         cx, d = self.width() / 2, 44
@@ -1235,7 +1377,9 @@ class RoundButton(_Pressable):
             p.setPen(QPen(QColor("white"), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             _glyph(p, self._glyph, 18)
         else:
-            p.setFont(_font(FONT_SEMIBOLD, 16))
+            is_symbol = any('\ue000' <= ch <= '\uf8ff' or '\u2500' <= ch <= '\u2bff' for ch in self._glyph)
+            p.setFont(_font(FONT_SYMBOLIC if is_symbol else FONT_SEMIBOLD, 18 if is_symbol else 16))
+            p.setPen(QColor("white"))
             p.drawText(QRectF(-d / 2, -d / 2, d, d), Qt.AlignCenter, self._glyph)
         p.restore()
         if self._label:
@@ -1514,35 +1658,47 @@ class Page(QWidget):
             self._gl_idle.start()
             return
         self._gl_on = True
+        _solid(layer, ("sys", "black"), QColor("black"))
         at = self.viewport.mapTo(self.window(), QPoint(0, 0))
         self._gl_ox, self._gl_oy = float(at.x()), float(at.y())
         layer.begin("scroll", self.window().rect(), self._gl_quads)
         self.viewport.setUpdatesEnabled(False)
+        self.body.hide()
 
     def _gl_quads(self) -> list:
         from ._gl import Quad
         w, view = float(self.viewport.width()), float(self.viewport.height())
         s0 = self._scroll - self._gl_top
         c0, c1 = max(0.0, s0), min(self._gl_h, s0 + view)
-        if c1 <= c0:
-            return []
-        return [Quad.rect((id(self), "list"), QRectF(0, c0 / self._gl_h, 1, (c1 - c0) / self._gl_h),
-                          self._gl_ox, self._gl_oy + c0 - s0, w, c1 - c0)]
+        # Cover the entire viewport, including the gap exposed by overscroll.
+        # Updates below the subsurface are frozen, so transparency would reveal
+        # the last stationary widget buffer in that gap.
+        quads = [Quad.rect(("sys", "black"), _WHOLE, self._gl_ox, self._gl_oy, w, view)]
+        if c1 > c0:
+            quads.append(Quad.rect((id(self), "list"), QRectF(0, c0 / self._gl_h, 1, (c1 - c0) / self._gl_h),
+                                   self._gl_ox, self._gl_oy + c0 - s0, w, c1 - c0))
+        return quads
 
     def _gl_end(self):
         """Still again: the widgets themselves, where the picture was."""
         if not self._gl_on:
             return
-        _settle()
         self._gl_on = False
         self._quiet = True
-        self.viewport.setUpdatesEnabled(True)
         self.body.move(0, -round(self._scroll))
+        self.body.show()
+        self.viewport.setUpdatesEnabled(True)
         self.viewport.repaint()
         self._quiet = False
+        # The list may have changed while hidden. Do not let the short settling
+        # window discard paints from custom or animated child widgets.
+        self._gl_dirty = True
+        self._version += 1
         layer = _layer_of(self)
         if layer is not None:
             layer.end("scroll")
+            _settle()
+            self._gl_idle.start()
 
     def _fit(self):
         w, view_h = self.viewport.width(), self.viewport.height()
@@ -1676,6 +1832,12 @@ class Page(QWidget):
         self.space(8)
         return slider
 
+    def seekbar(self, position: float = 0.0, duration: float = 0.0,
+                on_seek: Optional[Callable[[float], None]] = None) -> SeekBar:
+        bar = self.add(SeekBar(position, duration, on_seek))
+        self.space(8)
+        return bar
+
     def textbox(self, caption: str = "", text: str = "", on_change=None, on_submit=None,
                 password: bool = False, placeholder: str = "") -> TextBox:
         box = self.add(TextBox(caption, text, on_change, on_submit, password, placeholder))
@@ -1793,6 +1955,15 @@ class Pivot(QWidget):
     @property
     def body(self):
         return self.current().body
+
+    def bar(self, *buttons: RoundButton) -> AppBar:
+        """An app bar along the bottom of this pivot."""
+        if getattr(self, "app_bar", None) is None:
+            self.app_bar = AppBar()
+            self.layout().addWidget(self.app_bar)
+        for b in buttons:
+            self.app_bar.add(b)
+        return self.app_bar
 
     # pictures of the tabs, at the moving resolution
     def _at(self, k: int) -> int:
@@ -2366,6 +2537,15 @@ class App:
         # the window's app_id: "ztos." tells the shell this app brings its own
         # rows in as the phone's apps do (it then only uncovers it)
         self.qt.setDesktopFileName(f"ztos.{self.id}")
+        for font_path in [
+            os.path.join(os.path.expanduser("~/.local/share/fonts"), "SegMDL2.ttf"),
+            "/usr/share/fonts/SegMDL2.ttf",
+            os.path.join(os.path.dirname(__file__), "SegMDL2.ttf"),
+            os.path.join(os.getcwd(), "SegMDL2.ttf"),
+        ]:
+            if os.path.exists(font_path):
+                QFontDatabase.addApplicationFont(font_path)
+                break
         self.qt.setFont(_font(FONT_REGULAR, 15))
         fonts = ", ".join(f'"{f}"' if " " in f else f for f in FONT_REGULAR)
         self.qt.setStyleSheet(_STYLE % {"fonts": fonts, "accent": accent().name()})

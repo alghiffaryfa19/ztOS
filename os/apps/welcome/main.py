@@ -1,5 +1,5 @@
 """Welcome: ztOS's first-boot screens. A few pages of how the phone is used,
-the apps it comes with, updates, and the SDK; shown once, and kept in the app
+the apps it comes with, and the SDK; shown once, and kept in the app
 list for later."""
 import os
 import ztos
@@ -52,22 +52,14 @@ class Developers(Step):
         ], Done)
 
 
-class Updates(Step):
-    def __init__(self):
-        super().__init__("updates", [
-            "ztOS looks for updates once a day, and tells you when there are some.",
-            "The Updates app shows them and installs them; nothing is installed without you.",
-        ], Developers)
-        self.entry("open Updates", "look now", lambda: ztos.launch("/usr/local/lib/ztos/apps/os.ztos.updates"))
-
-
 class Apps(Step):
     def __init__(self):
         super().__init__("your apps", [
             "These came with ztOS. Tap one to open it now, or find it later in the app list.",
-        ], Updates)
+        ], Developers)
         for title, detail, command in (
             ("Settings", "Wi-Fi, accent colour, sounds, haptics", "ztsettings"),
+            ("Music", "streaming and offline listening", "/usr/local/lib/ztos/apps/com.zerone.music"),
             ("Firefox", "the web", "/usr/bin/firefox"),
             ("Chromium", "the web, the other way", "/usr/bin/chromium"),
             ("Terminal", "GNOME Terminal", "gnome-terminal"),

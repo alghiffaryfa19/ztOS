@@ -95,14 +95,16 @@ def fetch_tarball():
 
 
 def build_apps(stage: Path):
-    """ztOS's own SDK apps (Welcome, Updates), built for aarch64 on this computer."""
+    """Build the selected default system apps for aarch64."""
     out = stage / "apps"
+    # A reused staging directory must not keep apps removed from the defaults.
+    if out.exists():
+        shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(SDK))
     from ztos_sdk import cli as sdk
-    for project in sorted((OS / "apps").iterdir()):
-        if not (project / "ztos.toml").exists():
-            continue
+    projects = (OS / "apps" / "welcome", OS / "apps" / "whatsapp", ROOT / "apps" / "music")
+    for project in projects:
         p = sdk.find_project(str(project))
         python = "%d.%d" % sys.version_info[:2]
         binary = sdk.build(p, "aarch64", python=python)
@@ -301,6 +303,11 @@ echo ztos > "$R/etc/ztos/built"
 date -u +%Y-%m-%dT%H:%MZ >> "$R/etc/ztos/built"
 
 step "writing the system image"
+# Re-arm first boot even when building from a previously used root tree.
+# The image filesystem is smaller than the phone's USERDATA partition.
+if [ "$TARGET" = starlte ]; then
+	touch "$R/etc/zboot-firstboot"
+fi
 umount -l "$R/var/cache/pacman/pkg" 2>/dev/null || true
 umount -l "$R/tmp" "$R/proc" 2>/dev/null || true
 umount -lR "$R/dev" 2>/dev/null || true

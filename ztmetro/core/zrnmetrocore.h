@@ -41,10 +41,10 @@
 #define ZMC_MAX_HITS	160
 #define ZMC_MAX_ROWS	32
 
-#define FONT_LIGHT	"Segoe WP Light, Selawik Light, Selawik, Open Sans Light, sans-serif"
-#define FONT_SEMILIGHT	"Segoe WP Semilight, Selawik Semilight, Selawik, Open Sans, sans-serif"
-#define FONT_REGULAR	"Segoe WP, Selawik, Open Sans, sans-serif"
-#define FONT_SEMIBOLD	"Segoe WP Semibold, Selawik Semibold, Selawik, Open Sans Semibold, sans-serif"
+#define FONT_LIGHT	"Segoe UI Light, Selawik Light, Selawik, Open Sans Light, sans-serif"
+#define FONT_SEMILIGHT	"Segoe UI Semilight, Selawik Semilight, Selawik, Open Sans, sans-serif"
+#define FONT_REGULAR	"Segoe UI, Selawik, Open Sans, sans-serif"
+#define FONT_SEMIBOLD	"Segoe UI Semibold, Selawik Semibold, Selawik, Open Sans Semibold, sans-serif"
 #define FONT_MONO	"DejaVu Sans Mono, Liberation Mono, monospace"
 
 struct zmc_hit {

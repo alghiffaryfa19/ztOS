@@ -81,6 +81,64 @@ limits, silences them; and changing the audio bus or DSP core clock dividers
 while the DSP runs hangs the phone (`audio/probe/rate.sh` measures the
 playback rate against 48 kHz; 1.00 is right).
 
+## Music visualizer capture
+
+The Music app's original Cava capture kept the speaker sink active even
+while playback was paused and requested 512-frame processing blocks. This
+reproduced severe PipeWire underruns and distorted playback; closing the
+app did not reliably recover the already affected audio state.
+
+`apps/music/engine.py` now sets Cava's PipeWire input to `active = 0` and
+48 kHz, and gives only the Cava process `PIPEWIRE_LATENCY=2048/48000` to
+override its default latency request. The visualizer remains enabled but
+does not keep idle speakers running. The audio driver was restored unchanged
+after unsuccessful diagnostic experiments.
+
+After a TWRP hot reboot, two consecutive playback/stop cycles through the
+updated app ran with Cava and mpv active at 48 kHz, 2048-frame graph blocks,
+and zero reported errors. ALSA closed after each stop. Evidence:
+`build/power-analysis/music-passive-final.log` (2026-10-16).
+
+## Keyboard-sound regression (2026-10-16)
+
+The keyboard helper's low-latency streaming implementation repeatedly
+uncorked/corked an underfilled stream. Together with a 1024-frame graph default,
+this reproduced about 47 speaker-sink underruns per second during playback.
+The helper now predecodes the supplied WAVs and mixes a maximum of four voices
+into one reusable event stream. Full blocks are always supplied, including
+silent tails. Fast taps replace the oldest voice instead of creating more
+streams or queuing old taps. A 500 ms idle grace lets samples finish before
+corking. Keyboard volume scaling is retained and the helper is excluded from
+media detection. It reconnects when PipeWire restarts.
+
+The phone overlay fixes the graph at 48 kHz / 2048 frames. A device-specific
+WirePlumber rule sets the ABOX period and headroom to 2048 frames and uses
+hardware interrupts (`api.alsa.disable-tsched = true`). Buffer increases alone
+still produced errors; the interrupt setting removed them in the mixed test.
+Other audio devices do not receive this rule. `rtkit` is included for PipeWire's
+real-time scheduling support.
+
+Validation on the phone: playback, two keyframe seeks, pause/resume, the Music
+app's passive Cava visualizer (236 frames), and 90 mixed keyboard taps ran with
+zero reported speaker errors; ALSA closed after playback stopped. Evidence:
+`build/power-analysis/keyboard-audio-baseline.log` and
+`build/power-analysis/keyboard-audio-fixed.log`.
+
+The four-voice pool also passed a 600-request burst at 100 requests/second over
+playback: exactly one keyboard stream, no increase in the speaker error counter
+(8 before/throughout), and ALSA closed after idle. Evidence:
+`build/power-analysis/keyboard-pool-burst.log`. The tap stream was subsequently tuned from an 85 ms negotiated buffer to
+32 ms (`minreq=512` frames, while the speaker graph stays at 2048). A repeated
+600-request burst again left the speaker error counter unchanged. Single taps
+now use the requested volume; only overlapping voices share headroom.
+Evidence: `build/power-analysis/keyboard-pool-low-latency.log`.
+Mixer checks with address and
+undefined-behavior sanitizers cover oldest-voice replacement, the four-voice
+bound, clipping, and silent tails.
+
+The changes are installed on the test phone and included in fresh phone images.
+The ABOX kernel module and hardware clock registers were not changed.
+
 ## Not done
 
 - **Speaker protection.** On the stock system the DSP runs Maxim's DSM
