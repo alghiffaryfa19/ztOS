@@ -212,6 +212,7 @@ struct zt_layer {
 	GLuint tex;
 	int pw, ph;		/* pixels drawn */
 	int tw, th;		/* pixels of the texture, padded */
+	int alloc_tw, alloc_th;	/* dimensions last allocated on the GPU */
 	double w, h;		/* points */
 };
 
@@ -397,6 +398,7 @@ struct zt_output {
 	struct zt_server *server;
 	struct wlr_output *wlr_output;
 	struct wl_listener frame, request_state, destroy;
+	struct wlr_buffer *last_submitted; /* identity only; never dereferenced */
 };
 
 struct zt_server {
@@ -491,7 +493,7 @@ struct zt_server {
 	/* developer switches, from the config */
 	bool demo_tiles;		/* stand-in tiles on Start, for trying its motion */
 	bool slow_motion;		/* every animation five times as long */
-	int menu_speed;			/* Start's own motion, percent of normal speed */
+	int menu_speed;			/* the whole UI's motion, percent of normal speed */
 	bool show_touches;
 	bool lock_enabled;
 	/* the volume keys' banner */
@@ -570,6 +572,7 @@ struct zt_server {
 	struct wl_event_source *launch_timer;
 	uint32_t launch_ms;		/* when the tile was tapped */
 	uint32_t record_until;		/* "record MS": frames saved to /tmp/ztrec until then */
+	bool record_top;
 
 	struct tile tiles[MAX_TILES];
 	int n_tiles;
@@ -678,8 +681,14 @@ static void damage(struct zt_server *server) {
 	}
 }
 
-/* Move *value to `to` over `duration` ms, after `delay` ms. A value already
- * being animated is redirected from where it is now. */
+/* A length of the UI's motion at the speed the user set in Settings
+ * ("Animation speed"): it is the whole UI's, Start's and every app's. */
+static uint32_t menu_ms(struct zt_server *server, uint32_t ms) {
+	return ms * 100 / (uint32_t)(server->menu_speed > 0 ? server->menu_speed : 100);
+}
+
+/* Move *value to `to` over `duration` ms, after `delay` ms, at the speed the
+ * user set. A value already being animated is redirected from where it is now. */
 static void animate(struct zt_server *server, float *value, float to, uint32_t duration,
 		uint32_t delay, bool linear) {
 	struct zt_anim *slot = NULL;
@@ -697,6 +706,8 @@ static void animate(struct zt_server *server, float *value, float to, uint32_t d
 		damage(server);
 		return;
 	}
+	duration = menu_ms(server, duration);
+	delay = menu_ms(server, delay);
 	if (server->slow_motion && duration > 1) {
 		duration *= 5;
 		delay *= 5;
@@ -706,6 +717,20 @@ static void animate(struct zt_server *server, float *value, float to, uint32_t d
 		.start = now_ms() + delay, .duration = duration ? duration : 1, .linear = linear,
 	};
 	damage(server);
+}
+
+/* Use a timestamp shared with a client. animate() scales relative delays by
+ * the menu speed, so passing an already scaled wall-clock delay through it
+ * would postpone the reveal a second time. */
+static void animate_at(struct zt_server *server, float *value, float to,
+		uint32_t duration, uint32_t at, bool linear) {
+	animate(server, value, to, duration, 0, linear);
+	for (int i = 0; i < MAX_ANIMS; i++) {
+		if (server->anims[i].active && server->anims[i].value == value) {
+			server->anims[i].start = at;
+			break;
+		}
+	}
 }
 
 /* Where *value is going: the end of its animation, or where it is. */
@@ -1043,8 +1068,10 @@ static void zt_buffer_show(struct zt_server *server, struct zt_layer *layer,
 	layer->w = w;
 	layer->h = h;
 	if (gl_begin(server)) {
+		bool created = false;
 		if (!layer->tex) {
 			glGenTextures(1, &layer->tex);
+			created = true;
 		}
 		glBindTexture(GL_TEXTURE_2D, layer->tex);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -1055,8 +1082,19 @@ static void zt_buffer_show(struct zt_server *server, struct zt_layer *layer,
 #ifdef GL_UNPACK_ROW_LENGTH_EXT
 		glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, 0);
 #endif
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, layer->tw, layer->th, 0, GL_RGBA,
-			GL_UNSIGNED_BYTE, cairo_image_surface_get_data(buffer->surface));
+		/* Shade and status layers are redrawn when their contents change, but
+		 * their dimensions usually stay fixed. Keep the GPU allocation and only
+		 * replace its pixels; reallocating it on every shade update stalls some
+		 * mobile GLES drivers. */
+		if (created || layer->alloc_tw != layer->tw || layer->alloc_th != layer->th) {
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, layer->tw, layer->th, 0, GL_RGBA,
+				GL_UNSIGNED_BYTE, cairo_image_surface_get_data(buffer->surface));
+			layer->alloc_tw = layer->tw;
+			layer->alloc_th = layer->th;
+		} else {
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, layer->tw, layer->th, GL_RGBA,
+				GL_UNSIGNED_BYTE, cairo_image_surface_get_data(buffer->surface));
+		}
 		glBindTexture(GL_TEXTURE_2D, 0);
 		gl_end(server);
 	}
@@ -1575,12 +1613,12 @@ static void draw_icon_vector(cairo_t *cr, const char *name, double cx, double cy
 		/* Canonical Windows Phone AppBar plug (Templarian / Windows Phone SDK):
 		 * Prongs: -u*0.28..-u*0.07 and u*0.07..u*0.28, y: -u*0.95..-u*0.55
 		 * Body: -u*0.50..u*0.50, y: -u*0.55..u*0.15, rounded corners r=u*0.22
-		 * Cord: -u*0.14..u*0.14, y: u*0.15..u*0.85
+		 * Cord: -u*0.14..u*0.14, y: u*0.15..u*0.80
 		 */
 		cairo_new_path(cr);
 		cairo_move_to(cr, u * 0.14, u * 0.15);
-		cairo_line_to(cr, u * 0.14, u * 0.85);
-		cairo_line_to(cr, -u * 0.14, u * 0.85);
+		cairo_line_to(cr, u * 0.14, u * 0.80);
+		cairo_line_to(cr, -u * 0.14, u * 0.80);
 		cairo_line_to(cr, -u * 0.14, u * 0.15);
 		cairo_line_to(cr, -u * 0.28, u * 0.15);
 		cairo_curve_to(cr, -u * 0.398, u * 0.15, -u * 0.50, u * 0.052, -u * 0.50, -u * 0.07);
@@ -3119,80 +3157,49 @@ static void status_row(struct zt_server *server, cairo_t *cr, bool details, bool
 	double nub_h = round(cell * 0.38);
 	double bx = right - clock_w - cell * 0.9 - (bw + gap + nub_w);
 	if (battery >= 0) {
-		double y_top = base - cell;
-		double y_bot = base;
 		double cx = bx + bw / 2.0;
-		double pw = round(cell * 0.72);
-		double cw = round(cell * 0.16);
-		double prong_h = round(cell * 0.26);
-		double prong_w = round(cell * 0.13);
-		double prong_gap = round(cell * 0.15);
-		double body_h = round(cell * 0.58);
-		double corner_r = round(cell * 0.18);
+		double cy = base - cell / 2.0;
 
 		cairo_set_source_rgb(cr, 1, 1, 1);
 		/* Terminal nub on the right */
-		cairo_rectangle(cr, bx + bw + gap, y_top + (cell - nub_h) / 2.0, nub_w, nub_h);
+		cairo_rectangle(cr, bx + bw + gap, base - cell * 0.78, nub_w, cell * 0.56);
 		cairo_fill(cr);
 
-		/* Battery outline */
+		/* Battery outline - solid unbroken continuous rectangle */
 		cairo_set_line_width(cr, line);
 		cairo_set_line_cap(cr, CAIRO_LINE_CAP_SQUARE);
-		if (!server->charging) {
-			cairo_rectangle(cr, bx + line / 2.0, y_top + line / 2.0, bw - line, cell - line);
-			cairo_stroke(cr);
-		} else {
-			/* Left wall */
-			cairo_move_to(cr, bx + line / 2.0, y_top + line / 2.0);
-			cairo_line_to(cr, bx + line / 2.0, y_bot - line / 2.0);
-			/* Right wall */
-			cairo_move_to(cr, bx + bw - line / 2.0, y_top + line / 2.0);
-			cairo_line_to(cr, bx + bw - line / 2.0, y_bot - line / 2.0);
-			/* Top line (two segments with gap around plug body) */
-			double top_cut_left = cx - pw / 2.0 - gap;
-			double top_cut_right = cx + pw / 2.0 + gap;
-			cairo_move_to(cr, bx + line / 2.0, y_top + line / 2.0);
-			cairo_line_to(cr, top_cut_left, y_top + line / 2.0);
-			cairo_move_to(cr, top_cut_right, y_top + line / 2.0);
-			cairo_line_to(cr, bx + bw - line / 2.0, y_top + line / 2.0);
-			/* Bottom line (two segments with gap around cord) */
-			double bot_cut_left = cx - cw / 2.0 - gap;
-			double bot_cut_right = cx + cw / 2.0 + gap;
-			cairo_move_to(cr, bx + line / 2.0, y_bot - line / 2.0);
-			cairo_line_to(cr, bot_cut_left, y_bot - line / 2.0);
-			cairo_move_to(cr, bot_cut_right, y_bot - line / 2.0);
-			cairo_line_to(cr, bx + bw - line / 2.0, y_bot - line / 2.0);
-			cairo_stroke(cr);
-		}
+		cairo_rectangle(cr, bx + line / 2.0, base - cell + line / 2.0, bw - line, cell - line);
+		cairo_stroke(cr);
 
-		/* The charge: Windows Phone warning red below 15%, solid white otherwise.
-		 * In authentic WP8.1 charging mode, the battery frame holds the centered
-		 * plug cleanly (plus the red bar if low); it does not paint a white bar
-		 * sliced by an artificial black cutout box. */
+		/* The charge: Windows Phone warning red below 15%, solid white otherwise */
 		double inset = line + gap;
 		double max_fill_w = bw - 2 * inset;
 		double fill_w = max_fill_w * battery / 100.0;
-		if (battery <= 15) {
+		if (battery <= 15)
 			cairo_set_source_rgb(cr, 0.898, 0.078, 0.0);
-			if (fill_w > 0) {
-				cairo_rectangle(cr, bx + inset, y_top + inset, fill_w, cell - 2 * inset);
-				cairo_fill(cr);
-			}
-		} else if (!server->charging) {
+		else
 			cairo_set_source_rgb(cr, 1, 1, 1);
-			if (fill_w > 0) {
-				cairo_rectangle(cr, bx + inset, y_top + inset, fill_w, cell - 2 * inset);
-				cairo_fill(cr);
-			}
+		if (fill_w > 0) {
+			cairo_rectangle(cr, bx + inset, base - cell + inset, fill_w, cell - 2 * inset);
+			cairo_fill(cr);
 		}
 
 		if (server->charging) {
-
 			server->battery_full = battery >= 100;
-			int pw_i = (int)ceil(pw) + 4;
-			int ph_i = (int)ceil(prong_h + cell) + 4;
+			double pw = round(cell * 0.58);
+			double body_h = round(cell * 0.58);
+			double cw = round(cell * 0.18);
+			if (cw < 2.0) cw = 2.0;
+			double prong_w = round(cell * 0.13);
+			double prong_gap = round(cell * 0.18);
+			double prong_h = round(cell * 0.32);
+			double cord_h = round(cell * 0.32);
+
+			double total_plug_h = prong_h + body_h + cord_h;
+			int pw_i = (int)ceil(pw) + 12;
+			int ph_i = (int)ceil(total_plug_h) + 12;
 			server->plug_x = (float)(cx - pw_i / 2.0);
-			server->plug_y = (float)(y_top - prong_h - 2);
+			server->plug_y = (float)(cy - ph_i / 2.0);
 
 			if (live) {
 				cairo_t *pc;
@@ -3200,47 +3207,55 @@ static void status_row(struct zt_server *server, cairo_t *cr, bool details, bool
 				cairo_set_operator(pc, CAIRO_OPERATOR_CLEAR);
 				cairo_paint(pc);
 				cairo_set_operator(pc, CAIRO_OPERATOR_OVER);
-				cairo_set_source_rgb(pc, 1, 1, 1);
 
 				double pcx = pw_i / 2.0;
-				double py_top = 2 + prong_h;
-				/* Prongs */
-				cairo_rectangle(pc, pcx - prong_gap / 2.0 - prong_w, 2, prong_w, prong_h);
-				cairo_rectangle(pc, pcx + prong_gap / 2.0, 2, prong_w, prong_h);
+				double pcy = ph_i / 2.0;
+				double py_body_top = pcy - body_h / 2.0;
+				double py_prongs_top = py_body_top - prong_h;
+				double py_cord_top = py_body_top + body_h;
+
+				/* 1. Black silhouette */
+				cairo_set_source_rgb(pc, 0, 0, 0);
+				cairo_rectangle(pc, pcx - prong_gap / 2.0 - prong_w - 1.4, py_prongs_top - 1.4, prong_w + 2.8, prong_h + 1.4);
+				cairo_rectangle(pc, pcx + prong_gap / 2.0 - 1.4, py_prongs_top - 1.4, prong_w + 2.8, prong_h + 1.4);
 				cairo_fill(pc);
-				/* Plug body */
-				cairo_new_sub_path(pc);
-				cairo_move_to(pc, pcx - pw / 2.0, py_top);
-				cairo_line_to(pc, pcx + pw / 2.0, py_top);
-				cairo_line_to(pc, pcx + pw / 2.0, py_top + body_h - corner_r);
-				cairo_arc(pc, pcx + pw / 2.0 - corner_r, py_top + body_h - corner_r, corner_r, 0, M_PI / 2);
-				cairo_line_to(pc, pcx - pw / 2.0 + corner_r, py_top + body_h);
-				cairo_arc(pc, pcx - pw / 2.0 + corner_r, py_top + body_h - corner_r, corner_r, M_PI / 2, M_PI);
-				cairo_close_path(pc);
+				cairo_rectangle(pc, pcx - pw / 2.0 - 1.4, py_body_top - 1.4, pw + 2.8, body_h + 2.8);
 				cairo_fill(pc);
-				/* Cord */
-				cairo_rectangle(pc, pcx - cw / 2.0, py_top + body_h - 1, cw, cell - body_h + 1);
+				cairo_rectangle(pc, pcx - cw / 2.0 - 1.4, py_cord_top, cw + 2.8, cord_h + 1.4);
+				cairo_fill(pc);
+
+				/* 2. White boxy plug */
+				cairo_set_source_rgb(pc, 1, 1, 1);
+				cairo_rectangle(pc, pcx - prong_gap / 2.0 - prong_w, py_prongs_top, prong_w, prong_h);
+				cairo_rectangle(pc, pcx + prong_gap / 2.0, py_prongs_top, prong_w, prong_h);
+				cairo_fill(pc);
+				cairo_rectangle(pc, pcx - pw / 2.0, py_body_top, pw, body_h);
+				cairo_fill(pc);
+				cairo_rectangle(pc, pcx - cw / 2.0, py_cord_top, cw, cord_h);
 				cairo_fill(pc);
 
 				zt_buffer_show(server, &server->plug_layer, pb, pc, pw_i, ph_i);
-			} else {
+			} else if (server->battery_full || server->st_plug > 0.5f) {
+				double py_body_top = cy - body_h / 2.0;
+				double py_prongs_top = py_body_top - prong_h;
+				double py_cord_top = py_body_top + body_h;
+
+				cairo_set_source_rgb(cr, 0, 0, 0);
+				cairo_rectangle(cr, cx - prong_gap / 2.0 - prong_w - 1.4, py_prongs_top - 1.4, prong_w + 2.8, prong_h + 1.4);
+				cairo_rectangle(cr, cx + prong_gap / 2.0 - 1.4, py_prongs_top - 1.4, prong_w + 2.8, prong_h + 1.4);
+				cairo_fill(cr);
+				cairo_rectangle(cr, cx - pw / 2.0 - 1.4, py_body_top - 1.4, pw + 2.8, body_h + 2.8);
+				cairo_fill(cr);
+				cairo_rectangle(cr, cx - cw / 2.0 - 1.4, py_cord_top, cw + 2.8, cord_h + 1.4);
+				cairo_fill(cr);
+
 				cairo_set_source_rgb(cr, 1, 1, 1);
-				/* Prongs */
-				cairo_rectangle(cr, cx - prong_gap / 2.0 - prong_w, y_top - prong_h, prong_w, prong_h);
-				cairo_rectangle(cr, cx + prong_gap / 2.0, y_top - prong_h, prong_w, prong_h);
+				cairo_rectangle(cr, cx - prong_gap / 2.0 - prong_w, py_prongs_top, prong_w, prong_h);
+				cairo_rectangle(cr, cx + prong_gap / 2.0, py_prongs_top, prong_w, prong_h);
 				cairo_fill(cr);
-				/* Plug body */
-				cairo_new_sub_path(cr);
-				cairo_move_to(cr, cx - pw / 2.0, y_top);
-				cairo_line_to(cr, cx + pw / 2.0, y_top);
-				cairo_line_to(cr, cx + pw / 2.0, y_top + body_h - corner_r);
-				cairo_arc(cr, cx + pw / 2.0 - corner_r, y_top + body_h - corner_r, corner_r, 0, M_PI / 2);
-				cairo_line_to(cr, cx - pw / 2.0 + corner_r, y_top + body_h);
-				cairo_arc(cr, cx - pw / 2.0 + corner_r, y_top + body_h - corner_r, corner_r, M_PI / 2, M_PI);
-				cairo_close_path(cr);
+				cairo_rectangle(cr, cx - pw / 2.0, py_body_top, pw, body_h);
 				cairo_fill(cr);
-				/* Cord */
-				cairo_rectangle(cr, cx - cw / 2.0, y_top + body_h - 1, cw, cell - body_h + 1);
+				cairo_rectangle(cr, cx - cw / 2.0, py_cord_top, cw, cord_h);
 				cairo_fill(cr);
 			}
 			cairo_set_source_rgb(cr, 1, 1, 1);
@@ -3476,9 +3491,9 @@ static int net_tick(void *data) {
 		snap(server, &server->st_plug, 1.0f);
 		redraw = true;
 	} else if (charging && battery < 100) {
-		/* there for a second, faint for a second */
-		animate(server, &server->st_plug, anim_target(server, &server->st_plug) > 0.5f ? 0.15f : 1.0f,
-			420, 0, false);
+		/* Instant blink: toggle between fully visible (1.0f) and fully invisible (0.0f) with no after-image */
+		snap(server, &server->st_plug, server->st_plug > 0.5f ? 0.0f : 1.0f);
+		damage(server);
 	}
 	if (redraw) {
 		draw_status(server);
@@ -4109,11 +4124,6 @@ static float start_out_ms(struct zt_server *server) {
 		TILE_TAPPED_WAIT_MS + TILE_TAPPED_LIFE_MS;
 }
 
-/* A length of Start's own motion at the speed the user set. */
-static uint32_t menu_ms(struct zt_server *server, uint32_t ms) {
-	return ms * 100 / (uint32_t)(server->menu_speed > 0 ? server->menu_speed : 100);
-}
-
 static void start_turn(struct zt_server *server, bool away, uint32_t delay) {
 	if (!away && !server->start_back) {
 		server->turn_seed = (uint32_t)rand();
@@ -4132,7 +4142,7 @@ static void start_turn(struct zt_server *server, bool away, uint32_t delay) {
 		server->return_ms = TILE_ROW_MS * rows + TILE_LEFT_MS + TILE_LIFE_MS * 1.35f + TILE_JITTER_MS;
 	}
 	animate(server, &server->start_t, away ? 1.0f : 0.0f,
-		menu_ms(server, (uint32_t)(away ? server->out_ms : server->return_ms)), delay, true);
+		(uint32_t)(away ? server->out_ms : server->return_ms), delay, true);	/* animate() stretches it */
 }
 
 static void perf_tell(const char *command);
@@ -4195,11 +4205,11 @@ static void show_toplevel(struct zt_server *server, struct zt_toplevel *toplevel
 			server->leaving = previous;
 			animate(server, &server->app_angle, TURN_OUT_DEG, APP_OUT_MS, 0, false);
 			animate(server, &server->app_alpha, 0.0f, APP_OUT_MS, 0, false);
-			start_turn(server, false, APP_OUT_MS + menu_ms(server, BACK_GAP_MS));
+			start_turn(server, false, APP_OUT_MS + BACK_GAP_MS);	/* animate() stretches it */
 		} else {
 			/* it closed by itself: a moment of black, then Start */
 			server->leaving = NULL;
-			start_turn(server, false, menu_ms(server, BACK_GAP_MS));
+			start_turn(server, false, BACK_GAP_MS);	/* animate() stretches it */
 		}
 		return;
 	}
@@ -4213,17 +4223,21 @@ static void show_toplevel(struct zt_server *server, struct zt_toplevel *toplevel
 	/* Start swings away if it has not already, and the app arrives */
 	server->leaving = NULL;
 	bool start_was_visible = server->start_t < 0.5f;
-	start_turn(server, true, 0);
+	if (anim_target(server, &server->start_t) < 0.999f) {
+		start_turn(server, true, 0);
+	}
 	const char *app_id = toplevel->xdg_toplevel->app_id;
 	if (!toplevel->introduced && app_id &&
 			(strncmp(app_id, "zt", 2) == 0 || strncmp(app_id, "zrn", 3) == 0)) {
-		/* One of ours, in front for the first time: it feathers its own
-		 * rows in, and was told when the tile was tapped so that it starts
-		 * as Start has gone. It only has to be uncovered at that moment. */
+		/* Native apps turn their own rows in, on the same clock as Start's
+		 * tiles turning away. The shell only uncovers the client at that time. */
 		uint32_t now = now_ms(), at = server->launch_ms +
 			menu_ms(server, (uint32_t)start_out_ms(server) + TURN_GAP_MS) * (server->slow_motion ? 5 : 1);
-		uint32_t delay = (int32_t)(at - now) > 0 && at - now < 6000 ? at - now : 0;
+		if ((int32_t)(at - now) < 0 || at - now > 6000) {
+			at = now;
+		}
 		server->app_angle = 0.0f;
+		animate(server, &server->app_angle, 0.0f, 1, 0, true);
 		server->app_alpha = 0.0f;
 		if (strncmp(app_id, "ztos.", 5) == 0) {
 			/* an SDK app: uncovered when it says it is ready ("ready ID") */
@@ -4234,11 +4248,14 @@ static void show_toplevel(struct zt_server *server, struct zt_toplevel *toplevel
 				server->loading_since = now;
 			}
 		} else {
-			animate(server, &server->app_alpha, 1.0f, 1, delay, true);
+			animate_at(server, &server->app_alpha, 1.0f, 1, at, true);
 		}
 	} else {
 		/* anything else swings in whole, round the same edge */
-		uint32_t delay = start_was_visible ? menu_ms(server, (uint32_t)start_out_ms(server) + TURN_GAP_MS) : 0;	/* animate() stretches it */
+		uint32_t delay = 0;
+		if (start_was_visible && !toplevel->introduced) {
+			delay = (uint32_t)(start_out_ms(server) - TILE_TAPPED_LIFE_MS);
+		}
 		server->app_angle = TURN_IN_DEG;
 		server->app_alpha = 0.0f;
 		animate(server, &server->app_angle, 0.0f, APP_IN_MS, delay, false);
@@ -4318,21 +4335,21 @@ static void launch(struct zt_server *server, const char *command) {
 		wl_event_source_timer_update(server->launch_timer, server->slow_motion ? 3500 : 900);
 		return;
 	}
+	uint32_t launch_at = now_ms();
+	uint32_t enter_at = launch_at +
+		menu_ms(server, (uint32_t)start_out_ms(server) + TURN_GAP_MS) * (server->slow_motion ? 5 : 1);
 	pid_t pid = fork();
 	if (pid == 0) {
 		setsid();
 		child_priority();
-		/* when it was asked for, and when its entrance should start (Start
-		 * gone, the black after it), on the clock we both read: an app of
-		 * ours times its arrival by it */
+		/* The client has its first row snapshot ready before the shell
+		 * uncovers it. Both sides use this monotonic deadline unchanged. */
 		char stamp[24];
-		uint32_t now = now_ms();
-		snprintf(stamp, sizeof(stamp), "%u", now);
-		setenv("ZTMETRO_LAUNCH_MS", stamp, 1);
-		/* (slow motion stretches Start's exit, so the entrance waits as long) */
-		snprintf(stamp, sizeof(stamp), "%u",
-			now + menu_ms(server, (uint32_t)start_out_ms(server) + TURN_GAP_MS) * (server->slow_motion ? 5 : 1));
+		snprintf(stamp, sizeof(stamp), "%u", enter_at);
 		setenv("ZTMETRO_ENTER_MS", stamp, 1);
+		snprintf(stamp, sizeof(stamp), "%u", server->menu_speed);
+		setenv("ZTMETRO_MENU_SPEED", stamp, 1);
+		setenv("ZTMETRO_SLOW_MOTION", server->slow_motion ? "1" : "0", 1);
 		/* we ignore SIGCHLD so our children are reaped for us; an ignored
 		 * signal survives exec, and an app with it ignored cannot wait for
 		 * its own children (system() and pclose() fail) */
@@ -4344,7 +4361,7 @@ static void launch(struct zt_server *server, const char *command) {
 		_exit(127);
 	}
 	*started = pid;
-	server->launch_ms = now_ms();
+	server->launch_ms = launch_at;
 	server->loading_since = server->launch_ms;
 	wlr_log(WLR_INFO, "launched '%s' as %d", command, pid);
 	/* turnstile: Start swings away now, the app swings in when it maps */
@@ -4813,6 +4830,8 @@ static void apply_decoration(struct zt_server *server, struct wlr_xdg_toplevel *
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 	struct zt_toplevel *toplevel = wl_container_of(listener, toplevel, commit);
 	struct zt_server *server = toplevel->server;
+	struct wlr_xdg_surface *xdg = toplevel->xdg_toplevel->base;
+	(void)xdg;
 	if (toplevel->xdg_toplevel->base->initial_commit) {
 		/* Every app gets the whole app area, and is told it is maximised so
 		 * it draws no shadows or resize borders. */
@@ -6818,7 +6837,12 @@ static void ctl_command(struct zt_server *server, char *line) {
 		} else {
 			note_add(server, "System", line + 7, bar ? bar + 1 : "");
 		}
+	} else if (sscanf(line, "recordtop %d", &id) == 1) {
+		mkdir("/tmp/ztrec", 0755);
+		server->record_top = true;
+		server->record_until = now_ms() + (uint32_t)id;
 	} else if (sscanf(line, "record %d", &id) == 1) {
+		server->record_top = false;
 		/* save every frame drawn for the next `id` ms (see render_frame) */
 		mkdir("/tmp/ztrec", 0755);
 		server->record_until = now_ms() + (uint32_t)id;
@@ -7302,6 +7326,8 @@ static void render_frame(struct zt_server *server) {
 		wlr_output_state_finish(&state);
 		return;
 	}
+	if (buffer == server->output->last_submitted)
+		wlr_log(WLR_ERROR, "output acquired its most recently submitted scanout buffer");
 	GLuint fbo = wlr_gles2_renderer_get_buffer_fbo(server->renderer, buffer);
 	if (!fbo || !gl_begin(server)) {
 		wlr_log(WLR_ERROR, "render: no framebuffer for the output buffer (fbo %u)", fbo);
@@ -7522,8 +7548,10 @@ static void render_frame(struct zt_server *server) {
 	}
 	layer_draw(server, &server->status_layer, 0, 0, 1.0f);
 	if (server->charging && server->plug_layer.tex) {
-		layer_draw(server, &server->plug_layer, server->plug_x, server->plug_y,
-			server->battery_full ? 1.0f : server->st_plug);
+		float a = server->battery_full ? 1.0f : server->st_plug;
+		if (a > 0.5f) {
+			layer_draw(server, &server->plug_layer, server->plug_x, server->plug_y, 1.0f);
+		}
 	}
 	if (server->peek > 0.001f && server->peek_layer.tex) {
 		/* held: the taller row stays where it is and its lower edge comes
@@ -7657,28 +7685,32 @@ static void render_frame(struct zt_server *server) {
 	}
 
 	if (server->record_until && (int32_t)(server->record_until - now) > 0) {
-		/* every frame drawn, a quarter size each way, for comparing motion
-		 * with a reference video frame by frame (slows the frame it reads) */
+		/* Read a smaller title region when debugging resume, and write each
+		 * image once. Per-pixel stdio used to stall the transition we measured. */
 		static uint8_t *pixels;
+		static size_t capacity;
 		int w = output->width, h = output->height;
-		pixels = pixels ? pixels : malloc((size_t)w * h * 4);
-		if (pixels) {
+		if (server->record_top && h > 240 * server->scale) h = 240 * server->scale;
+		size_t rgba = (size_t)w * h * 4, rgb = (size_t)(w/4) * (h/4) * 3;
+		if (capacity < rgba + rgb) {
+			uint8_t *next = realloc(pixels, rgba + rgb);
+			if (next) { pixels = next; capacity = rgba + rgb; }
+		}
+		if (pixels && capacity >= rgba + rgb) {
 			glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+			uint8_t *packed = pixels + rgba;
+			for (int y = 0; y < h/4; y++) for (int x = 0; x < w/4; x++)
+				memcpy(packed + ((size_t)y*(w/4)+x)*3,
+					pixels + ((size_t)(y*4)*w+x*4)*4, 3);
 			char path[64];
-			wlr_log(WLR_INFO, "rec %u: start_t %.3f back %d tapped %d turn0 %.3f turnN %.3f shown %d alpha %.2f angle %.1f",
-				now, server->start_t, server->start_back, server->tapped,
-				server->n_tiles ? tile_turn(server, 0) : -1.0f,
-				server->n_tiles ? tile_turn(server, server->n_tiles - 1) : -1.0f,
-				server->shown != NULL, server->app_alpha, server->app_angle);
+			wlr_log(WLR_INFO, "rec %u: app %s alpha %.2f angle %.1f",
+				now, app ? app_name(app) : "Start", server->app_alpha,
+				server->app_angle);
 			snprintf(path, sizeof(path), "/tmp/ztrec/%010u.ppm", now);
 			FILE *f = fopen(path, "wb");
 			if (f) {
-				fprintf(f, "P6\n%d %d\n255\n", w / 4, h / 4);
-				for (int y = 0; y < h / 4; y++) {
-					for (int x = 0; x < w / 4; x++) {
-						fwrite(pixels + ((size_t)(y * 4) * w + x * 4) * 4, 1, 3, f);
-					}
-				}
+				fprintf(f, "P6\n%d %d\n255\n", w/4, h/4);
+				fwrite(packed, 1, rgb, f);
 				fclose(f);
 			}
 		}
@@ -7694,6 +7726,8 @@ static void render_frame(struct zt_server *server) {
 	wlr_buffer_unlock(buffer);
 	if (!wlr_output_commit_state(output, &state)) {
 		wlr_log(WLR_ERROR, "output commit failed");
+	} else {
+		server->output->last_submitted = buffer;
 	}
 	wlr_output_state_finish(&state);
 	server->dirty = false;

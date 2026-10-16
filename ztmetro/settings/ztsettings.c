@@ -195,7 +195,7 @@ static struct {
 	int tickle[3];		/* mode on battery, plugged in, power saver: 0 none .. 3 high */
 	char tickle_now[96];	/* what zrnperfd says it is doing */
 	bool dev_demo_tiles, dev_slow, dev_touches, dev_lock;
-	int menu_speed_idx;	/* Start's animation speed: an index into menu_speeds */
+	int menu_speed_idx;	/* the UI's animation speed: an index into menu_speeds */
 	int haptic_strength;	/* percent */
 	int haptic_group[N_HAPTIC_GROUPS];	/* percent of the strength; 0 off */
 	int quick[8];		/* indexes into QUICK_IDS */
@@ -251,7 +251,7 @@ static void read_sys_file(const char *path, char *out, size_t size) {
 	}
 }
 
-/* Start's animation speed, percent of what was measured on the Lumia */
+/* The whole UI's animation speed, percent of what was measured on the Lumia */
 static const int menu_speeds[] = { 50, 75, 100, 125, 150, 200 };
 #define N_MENU_SPEEDS 6
 
@@ -763,8 +763,8 @@ static double draw_main(cairo_t *cr) {
 
 	cell_load();
 	snprintf(detail, sizeof(detail), "%s%s%s%s", cell.operator[0] ? cell.operator : "no service",
-		cell.tech[0] ? " " : "", cell.tech, !cell.data_on ? " \u2022 data off" : cell.data ?
-		" \u2022 data connected" : " \u2022 data on");
+		cell.tech[0] ? ", " : "", cell.tech, !cell.data_on ? ", data off" : cell.data ?
+		", data connected" : ", data on");
 	y = zmc_entry(cr, y, "cellular + SIM", detail, ACT_OPEN_PAGE, PAGE_MOBILE);
 
 	snprintf(detail, sizeof(detail), "media %d%%, ring %d%%", app.media_vol, app.ring_vol);
@@ -775,7 +775,7 @@ static double draw_main(cairo_t *cr) {
 	} else {
 		int on = 0;
 		for (int g = 0; g < N_HAPTIC_GROUPS; g++) on += app.haptic_group[g] > 0;
-		snprintf(detail, sizeof(detail), "on \u2022 strength %d%% \u2022 %d of %d kinds", app.haptic_strength,
+		snprintf(detail, sizeof(detail), "on, strength %d%%, %d of %d kinds", app.haptic_strength,
 			on, N_HAPTIC_GROUPS);
 	}
 	y = zmc_entry(cr, y, "haptics", detail, ACT_OPEN_PAGE, PAGE_HAPTICS);
@@ -787,19 +787,19 @@ static double draw_main(cairo_t *cr) {
 	char bat_buf[32];
 	read_sys_file("/sys/class/power_supply/max170xx_battery/capacity", bat_buf, sizeof(bat_buf));
 	int bat = bat_buf[0] ? atoi(bat_buf) : 51;
-	snprintf(detail, sizeof(detail), "%d%% \u2022 %s", bat, app.battery_saver ? "battery saver on" : "discharging");
+	snprintf(detail, sizeof(detail), "%d%%, %s", bat, app.battery_saver ? "battery saver on" : "discharging");
 	y = zmc_entry(cr, y, "battery saver", detail, ACT_OPEN_PAGE, PAGE_BATTERY);
 
-	snprintf(detail, sizeof(detail), "Exynos 9810 (8 cores) \u2022 %s", app.cpu_gov);
+	snprintf(detail, sizeof(detail), "Exynos 9810 (8 cores), %s", app.cpu_gov);
 	y = zmc_entry(cr, y, "processor", detail, ACT_OPEN_PAGE, PAGE_CPU);
 
-	snprintf(detail, sizeof(detail), "3.5 GB RAM \u2022 swappiness %d", app.swappiness);
+	snprintf(detail, sizeof(detail), "3.5 GB RAM, swappiness %d", app.swappiness);
 	y = zmc_entry(cr, y, "virtual memory", detail, ACT_OPEN_PAGE, PAGE_VM);
 
-	snprintf(detail, sizeof(detail), "Mali-G72 MP18 (%s) \u2022 60 FPS", app.gpu_gov);
+	snprintf(detail, sizeof(detail), "Mali-G72 MP18 (%s), 60 FPS", app.gpu_gov);
 	y = zmc_entry(cr, y, "graphics", detail, ACT_OPEN_PAGE, PAGE_GPU);
 
-	y = zmc_entry(cr, y, "about", "Samsung Galaxy S9 \u2022 ztOS Mobile", ACT_OPEN_PAGE, PAGE_ABOUT);
+	y = zmc_entry(cr, y, "about", "Samsung Galaxy S9, ztOS Mobile", ACT_OPEN_PAGE, PAGE_ABOUT);
 
 	return y + 20;
 }
@@ -812,7 +812,7 @@ static double draw_apps(cairo_t *cr) {
 		ACT_OPEN_PAGE, PAGE_KEYBOARD);
 
 	static const char *const profiles[] = { "Power saver", "Balanced", "Performance" };
-	snprintf(detail, sizeof(detail), "%s \u2022 low power when off: %s", profiles[app.perf_profile],
+	snprintf(detail, sizeof(detail), "%s, low power when off: %s", profiles[app.perf_profile],
 		app.perf_deepsleep ? "on" : "off");
 	y = zmc_entry(cr, y, "performance", detail, ACT_OPEN_PAGE, PAGE_PERF);
 
@@ -1101,7 +1101,7 @@ static double draw_mobile(cairo_t *cr) {
 	y = zmc_field(cr, y, "Mobile data", value);
 
 	snprintf(value, sizeof(value), "%s%s%s", strcmp(cell.sim, "ready") ? "No SIM" :
-		cell.operator[0] ? cell.operator : "No service", cell.tech[0] ? " • " : "", cell.tech);
+		cell.operator[0] ? cell.operator : "No service", cell.tech[0] ? ", " : "", cell.tech);
 	y = zmc_field(cr, y, "Network", value);
 	y = zmc_field(cr, y, "Registration", !strcmp(cell.registered, "home") ? "Registered, home network" :
 		!strcmp(cell.registered, "roaming") ? "Registered, roaming" :
@@ -1214,7 +1214,7 @@ static double draw_battery(cairo_t *cr) {
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	char est[64];
-	snprintf(est, sizeof(est), "%s \u2022 %.2f V \u2022 Maxim MAX17055", stat[0] ? stat : "Discharging", v);
+	snprintf(est, sizeof(est), "%s, %.2f V, Maxim MAX17055", stat[0] ? stat : "Discharging", v);
 	zmc_text(cr, est, FONT_REGULAR, 14, MARGIN, y, 0);
 	y += 36;
 
@@ -1229,7 +1229,7 @@ static double draw_battery(cairo_t *cr) {
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Battery information", FONT_REGULAR, 13, MARGIN, y, 0);
 	cairo_set_source_rgb(cr, 1, 1, 1);
-	zmc_text(cr, "3000 mAh Li-Ion \u2022 Health Good", FONT_REGULAR, 15, MARGIN, y + 20, 0);
+	zmc_text(cr, "3000 mAh Li-Ion, Health Good", FONT_REGULAR, 15, MARGIN, y + 20, 0);
 
 	return y + 60;
 }
@@ -1251,7 +1251,7 @@ static double draw_cpu(cairo_t *cr) {
 	y += 56;
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, "LITTLE Cluster (Cores 0-3 \u2022 Cortex-A55)", FONT_REGULAR, 13, MARGIN, y, 0);
+	zmc_text(cr, "LITTLE Cluster (Cores 0-3, Cortex-A55)", FONT_REGULAR, 13, MARGIN, y, 0);
 	char c0_str[64];
 	snprintf(c0_str, sizeof(c0_str), "%.0f MHz (350 - 1794 MHz)", f0);
 	cairo_set_source_rgb(cr, 1, 1, 1);
@@ -1259,7 +1259,7 @@ static double draw_cpu(cairo_t *cr) {
 	y += 52;
 
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
-	zmc_text(cr, "BIG Cluster (Cores 4-7 \u2022 M3 Cheetah)", FONT_REGULAR, 13, MARGIN, y, 0);
+	zmc_text(cr, "BIG Cluster (Cores 4-7, M3 Cheetah)", FONT_REGULAR, 13, MARGIN, y, 0);
 	char c4_str[64];
 	snprintf(c4_str, sizeof(c4_str), "%.0f MHz (400 - 2704 MHz)", f4);
 	cairo_set_source_rgb(cr, 1, 1, 1);
@@ -1336,7 +1336,7 @@ static double draw_gpu(cairo_t *cr) {
 	cairo_set_source_rgb(cr, 0.6, 0.6, 0.6);
 	zmc_text(cr, "Clock frequency", FONT_REGULAR, 13, MARGIN, y, 0);
 	char f_str[64];
-	snprintf(f_str, sizeof(f_str), "%.0f MHz (260 \u2022 455 \u2022 572 MHz)", mhz);
+	snprintf(f_str, sizeof(f_str), "%.0f MHz (260, 455, 572 MHz)", mhz);
 	cairo_set_source_rgb(cr, 1, 1, 1);
 	zmc_text(cr, f_str, FONT_REGULAR, 16, MARGIN, y + 20, 0);
 	y += 52;
@@ -1531,7 +1531,7 @@ static double draw_dev(cairo_t *cr) {
 	y = zmc_switch(cr, y, "Slow motion (5x)", app.dev_slow, ACT_DEV_SLOW);
 	static const char *const speeds[] = { "50 % (slow)", "75 %", "100 % (as on a Lumia)", "125 %",
 		"150 %", "200 % (fast)" };
-	y = picker(cr, y, "Start animation speed", speeds, N_MENU_SPEEDS, app.menu_speed_idx, ACT_DEV_MENU_SPEED);
+	y = picker(cr, y, "Animation speed", speeds, N_MENU_SPEEDS, app.menu_speed_idx, ACT_DEV_MENU_SPEED);
 	y = zmc_switch(cr, y, "Show touches", app.dev_touches, ACT_DEV_TOUCHES);
 	y = zmc_switch(cr, y, "Lock screen on wake", app.dev_lock, ACT_DEV_LOCK);
 	y = zmc_entry(cr, y, "ZrnDevTest", "logs, sensors and system state", ACT_DEV_OPEN_TEST, 0);

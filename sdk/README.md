@@ -13,6 +13,34 @@ ztos-sdk deploy             # build, install on the phone, open it there
 ztos-sdk logs -f            # what it prints, on the phone
 ```
 
+## Python API and native rendering
+
+Apps keep using the Python `ztos` API. Qt handles layout, input, accessibility,
+and prepares cached widget/text images. The C backend in
+[`native/renderer.c`](native/renderer.c) uploads those images and draws their
+movement through OpenGL: texture management, vertex generation, perspective,
+and premultiplied blending run in C. Python sends a batch of quads per frame.
+Content changes still require a Qt raster pass; this is not a full replacement
+of Qt's widget renderer. On the Galaxy S9, the system environment sets
+`PAN_MESA_DEBUG=noafbc`: compressed texture uploads produced intermittent
+Panfrost job faults and missing page headers during repeated launches. GLES
+rendering and GPU animation remain enabled with uncompressed textures. Entrance curves and shader compilation are shared with
+the native Settings renderer through `ztmetro/core/zrnmetrorender.h`.
+
+`ztos-sdk run` builds the host C library automatically. It needs `make`, a C
+compiler, `pkg-config`, and GLES2 development files. `install` and `deploy`
+build the phone library over SSH when the source changes, using the same tools
+on the phone. Later offline `build` commands reuse that cached target library.
+You can also cross-compile it with `make -C sdk/native ARCH=aarch64 CC=...`
+and the appropriate GLES2 sysroot/pkg-config configuration. The build checks a
+source hash, so changes to the shared header also trigger a rebuild.
+
+Each app archive includes its target library. The runtime extracts it into a
+cache named by its SHA-256 hash before loading it with `ctypes`; the warm
+runtime receives the same library during installation. No GL context is made
+until the app opens. Offscreen runs and devices without a working GPU retain
+the existing software path.
+
 ## What a built app is
 
 `ztos-sdk build` writes `dist/<id>`: one ELF file for aarch64, usually under
@@ -24,8 +52,8 @@ reads zip archives from their end, so the launcher just runs the phone's
 Qt's own title bar.
 
 Qt itself is not inside the binary. The phone provides it (`pyside6`,
-`qt6-wayland`, `qt6-svg` from Arch Linux ARM), which is why apps stay small and
-why the build can run on the laptop with no phone toolchain.
+`qt6-wayland`, `qt6-svg` from Arch Linux ARM), which is why apps stay small. The native renderer can be built on the phone
+during deployment, so a phone cross compiler is optional.
 
 `ztos-sdk install` copies files into the alarm user's home on the phone:
 

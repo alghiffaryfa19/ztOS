@@ -119,8 +119,11 @@ struct zmc_state {
 	uint32_t anim_total;
 	int anim_frames;
 	bool anim_active;
+	bool anim_cache_ready;	/* destination page already rendered for GLES */
+	bool anim_target_pending;	/* prepare it in the black gap after the outgoing rows */
 	bool anim_back;		/* going back or closing: the old page turns away */
 	bool entrance;		/* the app's first page arriving: it also glides in */
+	double entrance_rate;	/* shell animation speed, including slow motion */
 	uint32_t picker_until;	/* a list picker is opening or closing until then */
 	int anim_from, anim_to;
 	int anim_dir;

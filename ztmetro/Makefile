@@ -1,6 +1,6 @@
 # Builds on the phone itself (aarch64 Arch Linux ARM, wlroots 0.20).
 PKGS = wlroots-0.20 wayland-server xkbcommon cairo pangocairo librsvg-2.0 pixman-1 libdrm egl glesv2
-APP_PKGS = wayland-client cairo pangocairo
+APP_PKGS = wayland-client wayland-egl egl glesv2 cairo pangocairo
 WP := $(shell pkg-config --variable=pkgdatadir wayland-protocols)
 XDG := $(WP)/stable/xdg-shell/xdg-shell.xml
 CFLAGS ?= -O2 -g
@@ -23,8 +23,8 @@ apps/ztapps: apps/ztapps.c
 
 # ZrnMetroCore: the window, motion and widgets our own apps share
 VIEWPORTER := $(WP)/stable/viewporter/viewporter.xml
-CORE = core/zrnmetrocore.c core/xdg-shell-protocol.c core/viewporter-protocol.c
-CORE_DEPS = $(CORE) core/zrnmetrocore.h core/xdg-shell-client-protocol.h core/viewporter-client-protocol.h
+CORE = core/zrnmetrocore.c core/zrnmetrogpu.c core/xdg-shell-protocol.c core/viewporter-protocol.c
+CORE_DEPS = $(CORE) core/zrnmetrocore.h core/zrnmetrogpu.h core/zrnmetrorender.h core/xdg-shell-client-protocol.h core/viewporter-client-protocol.h
 APP_BUILD = $(CC) $(CFLAGS) $(WARN) -Icore $(shell pkg-config --cflags $(APP_PKGS))
 APP_LIBS = $(shell pkg-config --libs $(APP_PKGS)) -lm
 

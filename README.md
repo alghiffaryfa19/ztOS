@@ -1,5 +1,7 @@
 # ztOS
 
+**ALPHA-2** — Galaxy S9 (SM-G960N / starlte) build.
+
 ztOS is a phone operating system: the **ztMETRO** shell (Windows Phone 8.1's
 look and motion) on Arch Linux ARM and mainline Linux, with its own apps, an
 updater and an SDK for apps in Python and Qt. It runs on the Samsung Galaxy
@@ -85,7 +87,7 @@ notes say what. **Broken**: tried, does not work. **Not started**: nothing yet.
 | CPU | All 8 cores, frequency scaling | Works | The big cores are powered down when idle and brought back on demand (zrnperfd) |
 | CPU | Suspend / Idle Power-Down | Works | Per-core C2 power-down active on efficiency cores via zrn-cpuidle with MCT hardware broadcast timer; big cores dynamically offlined via zrnperfd with Rapid Boost |
 | Power | Battery and charger | Works | MAX17042 gauge, MAX77705 charger |
-| Network | Wi-Fi | Works | BCM4361; join, forget, details and per-network signal in Settings |
+| Network | Wi-Fi | Works | BCM4361; join, forget, details and per-network signal in Settings; PCIe link and Wi-Fi reconnect passed two AP hardware-sleep cycles |
 | Network | Bluetooth | Not started | |
 | Network | Mobile data (4G) | Works | Samsung IPC through ztOSCoreNetworking; access point set in Settings |
 | Network | USB networking to a computer | Works | 172.16.42.1 (the computer gets 172.16.42.2), plus a serial console |
@@ -115,7 +117,7 @@ notes say what. **Broken**: tried, does not work. **Not started**: nothing yet.
 | Apps | ZrnDevTest | Works | What the hardware reports |
 | Apps | Firefox, Chromium, terminal | Works | Ordinary Linux apps, shown by ztMETRO as windows |
 | System | Updates | Works | A daily check, a notification, and an Updates app (tested in the emulator) |
-| System | Installer (`installer/ztos`) | Partial | The QEMU path builds, installs and boots; the phone path is written and untested |
+| System | Installer (`installer/ztos`) | Partial | QEMU builds, installs and boots; the phone flow is implemented but not yet validated end to end on a fresh install |
 | SDK | ztOS SDK (apps in Python and Qt) | Works | Build, install, run, logs, uninstall from the app list; first start is slower than the native apps' |
 | Emulator | ztOS in QEMU | Partial | Boots and runs; slow, because the phone is fully emulated |
 
@@ -218,7 +220,7 @@ passphrase, so password auth is what actually gets used today.
 
 | Partition | Node | Holds |
 |---|---|---|
-| `BOOT` | `/dev/sda10` | `out/zboot-full2.img` — uniLoader + mainline kernel + initramfs (full1 plus the DECON flip fix and FUSE) |
+| `BOOT` | `/dev/sda10` | ztOS uniLoader + mainline kernel + initramfs; current device image is kernel #27, with PCIe/Wi-Fi resume support |
 | `RECOVERY` | `/dev/sda11` | stock TWRP 3.7.0_9-0, byte-identical to `stock/RECOVERY.img` |
 | `USERDATA` | `/dev/sda25` | the Arch root, ext4, label `ZR_ARCH` |
 

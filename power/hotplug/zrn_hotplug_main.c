@@ -41,7 +41,9 @@
  * PMU powers the cluster itself off, which needs more (Samsung's
  * cluster_disable: the big cluster's reset control and a mailbox bit) and
  * froze the phone when idle did it. So at least one little and one big core
- * always stay.
+ * always stay during ordinary hotplug. The explicit suspend_cluster_off
+ * option allows the last big CPU to leave only for PM_SUSPEND_MEM, with
+ * DFD disabled, using the stock CPD hint/mailbox setup and resume cleanup.
  */
 #include <linux/cpu.h>
 #include <linux/cpuhotplug.h>
@@ -49,6 +51,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
 #include <asm/cputype.h>
 
 #define PMU_BASE		0x14060000
@@ -62,7 +65,11 @@
 #define GRP2_PEND		0x0208
 #define GRP2_CLEAR		0x020c
 
-static void __iomem *pmu, *bid;
+static void __iomem *pmu, *bid, *cluster_mailbox;
+static bool suspend_cluster_off;
+module_param(suspend_cluster_off, bool, 0644);
+MODULE_PARM_DESC(suspend_cluster_off, "allow last big CPU offline only for suspend-to-RAM, DFD off");
+static bool big_cluster_down;
 static DEFINE_RAW_SPINLOCK(pmu_lock);
 static enum cpuhp_state hp_state;
 #define ZRN_DYING_STATE	CPUHP_AP_ARM_XEN_STARTING	/* a "dying" step nobody else has here */
@@ -91,6 +98,10 @@ static int zrn_hotplug_in(unsigned int cpu)
 	if (core > 7)
 		return 0;
 	raw_spin_lock_irqsave(&pmu_lock, flags);
+	if (core >= 4 && big_cluster_down) {
+		rmw(cluster_mailbox + 0x10, BIT(24), 0);
+		big_cluster_down = false;
+	}
 	writel_relaxed(0, pmu + PMU_CPU_INFORM(core));
 	rmw(bid + GRP2_ENABLE, bit, 0);
 	if (readl_relaxed(bid + GRP2_PEND) & bit)
@@ -110,6 +121,12 @@ static int zrn_hotplug_may_go(unsigned int cpu)
 	for_each_online_cpu(other)
 		left += other != cpu && (other < 4) == (cpu < 4);
 	if (!left) {
+		/* Ordinary hotplug keeps the original guard. System suspend
+		 * needs CPU0 alone; the dying callback supplies stock CPD setup. */
+		if (cpu >= 4 && READ_ONCE(suspend_cluster_off) &&
+		    pm_suspend_target_state == PM_SUSPEND_MEM &&
+		    !(readl_relaxed(pmu + 0x500) & BIT(0)))
+			return 0;
 		pr_info("zrn-hotplug: cpu%u is the last of its cluster and stays\n", cpu);
 		return -EBUSY;
 	}
@@ -123,9 +140,14 @@ static int zrn_hotplug_out(unsigned int cpu)
 	unsigned int core = this_core();
 	u32 bit = BIT((core + 4) & 7);
 	unsigned long flags;
+	unsigned int other;
+	bool last_big = core >= 4;
 
 	if (core > 7)
 		return 0;
+	for_each_online_cpu(other)
+		if (other != cpu && other >= 4)
+			last_big = false;
 	raw_spin_lock_irqsave(&pmu_lock, flags);
 	/* the hint first: without it the controller leaves the core powered,
 	 * parked in the firmware, and nothing can start it again */
@@ -134,6 +156,13 @@ static int zrn_hotplug_out(unsigned int cpu)
 	if (readl_relaxed(bid + GRP1_PEND) & bit)
 		rmw(bid + GRP1_CLEAR, bit, bit);
 	rmw(pmu + PMU_EVENT_INT_EN_GRP2, bit, bit);
+	if (last_big && READ_ONCE(suspend_cluster_off) &&
+	    pm_suspend_target_state == PM_SUSPEND_MEM) {
+		/* pmucal_cpu_cluster_disable(): CPD hint then AP->APM request. */
+		writel_relaxed(2, pmu + PMU_CPU_INFORM(core));
+		rmw(cluster_mailbox + 0x10, BIT(24), BIT(24));
+		big_cluster_down = true;
+	}
 	raw_spin_unlock_irqrestore(&pmu_lock, flags);
 	wmb();
 	return 0;
@@ -149,7 +178,8 @@ static int __init zrn_hotplug_init(void)
 	}
 	pmu = ioremap(PMU_BASE, 0x8000);
 	bid = ioremap(BID_BASE, 0x1000);
-	if (!pmu || !bid) {
+	cluster_mailbox = ioremap(0x14100000, 0x1000);
+	if (!pmu || !bid || !cluster_mailbox) {
 		ret = -ENOMEM;
 		goto unmap;
 	}
@@ -168,6 +198,8 @@ static int __init zrn_hotplug_init(void)
 	pr_info("zrn-hotplug: cores can be taken offline and brought back (one of each cluster stays)\n");
 	return 0;
 unmap:
+	if (cluster_mailbox)
+		iounmap(cluster_mailbox);
 	if (pmu)
 		iounmap(pmu);
 	if (bid)
@@ -179,6 +211,7 @@ static void __exit zrn_hotplug_exit(void)
 {
 	cpuhp_remove_state_nocalls(ZRN_DYING_STATE);
 	cpuhp_remove_state_nocalls(hp_state);
+	iounmap(cluster_mailbox);
 	iounmap(pmu);
 	iounmap(bid);
 }

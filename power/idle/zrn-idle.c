@@ -44,8 +44,11 @@
 #include <linux/spinlock.h>
 #include <linux/arm-smccc.h>
 #include <linux/tick.h>
+#include <linux/suspend.h>
 #include <asm/cputype.h>
 #include <asm/memory.h>
+
+#include "zrn-idle.h"
 
 #define PMU_BASE		0x14060000
 #define PMU_CPU_INFORM(c)	(0x0860 + 4 * (c))
@@ -64,13 +67,21 @@ module_param_named(suspend_enter, suspend_fn, ulong, 0444);
 MODULE_PARM_DESC(suspend_enter, "address of cpu_suspend (from /proc/kallsyms)");
 module_param_named(resume, resume_fn, ulong, 0444);
 MODULE_PARM_DESC(resume, "address of cpu_resume (from /proc/kallsyms)");
-static unsigned int cpus = 0xff;
+static unsigned int cpus = 0x0c;
 module_param(cpus, uint, 0444);
 MODULE_PARM_DESC(cpus, "mask of the CPUs to give the power-down state");
 
 static int (*cpu_suspend_p)(unsigned long arg, int (*fn)(unsigned long));
 static unsigned long cpu_resume_pa;
-static void __iomem *pmu, *bid;
+static void __iomem *pmu, *bid, *cluster_mailbox;
+static bool s2idle_cpd, cluster_down;
+static unsigned long cpd_attempts, cpd_entries;
+static int cpd_last_error;
+module_param(s2idle_cpd, bool, 0644);
+MODULE_PARM_DESC(s2idle_cpd, "offer non-boot cluster power down during system suspend only");
+module_param(cpd_attempts, ulong, 0444);
+module_param(cpd_entries, ulong, 0444);
+module_param(cpd_last_error, int, 0444);
 
 /*
  * The finisher: one SMC, the function id Samsung's firmware implements
@@ -142,10 +153,43 @@ static int enter_wfi(struct cpuidle_device *dev, struct cpuidle_driver *drv, int
 	return idx;
 }
 
-static int enter_powerdown(struct cpuidle_device *dev, struct cpuidle_driver *drv, int idx)
+/* Samsung flexpmu_cal_cpu_exynos9810.h: cluster1_off requests CPD through
+ * MAILBOX_APM2AP bit 24; PSCI_CLUSTER_SLEEP packs to 0x01000000. Any big
+ * CPU waking cancels the shared request before returning to its callers.
+ * DFD-enabled firmware needs additional reset handling; refuse that case. */
+static bool cluster_prepare(unsigned int core)
+{
+	unsigned long flags;
+	bool enter = false;
+	int cpu;
+
+	if (core < 4 || !READ_ONCE(s2idle_cpd) ||
+	    (readl_relaxed(pmu + 0x0500) & BIT(0)))
+		return false;
+	raw_spin_lock_irqsave(&zrn_c2_lock, flags);
+	for_each_online_cpu(cpu) {
+		if (cpu >= 4 && !test_bit(cpu, zrn_c2_mask))
+			goto out;
+	}
+	if (!cluster_down) {
+		cluster_down = true;
+		rmw(cluster_mailbox + 0x10, BIT(24), BIT(24));
+		writel_relaxed(2, pmu + PMU_CPU_INFORM(core));
+		wmb();
+		cpd_attempts++;
+		enter = true;
+	}
+out:
+	raw_spin_unlock_irqrestore(&zrn_c2_lock, flags);
+	return enter;
+}
+
+static int enter_powerdown_common(struct cpuidle_device *dev, struct cpuidle_driver *drv,
+				 int idx, bool suspended)
 {
 	u64 mpidr = read_cpuid_mpidr();
 	unsigned int core = zrn_core(mpidr);
+	bool cpd;
 	int ret;
 
 	if (core > 7)	/* not a core the PMU knows: stay in WFI */
@@ -154,19 +198,44 @@ static int enter_powerdown(struct cpuidle_device *dev, struct cpuidle_driver *dr
 	if (ret)
 		return -EBUSY;
 	core_off(core);
-	/*
-	 * Not psci_cpu_suspend_enter(): it reads bit 30 of the state word to
-	 * tell retention from power-down, and Samsung's 0x10000 has it clear,
-	 * so it would pass entry point 0 -- and a core that powers down
-	 * resumes through no frame at all (seen: the first IRQ lands on a
-	 * corrupted stack). cpu_suspend saves the frame on this stack and our
-	 * finisher hands the firmware cpu_resume's physical address, exactly
-	 * what Samsung's own idle path does.
-	 */
-	ret = cpu_suspend_p(PSCI_CORE_POWERDOWN, zrn_suspend_finisher);
+	/* in C2 from here: SICD (zrn-sicd.c) looks for every online core set */
+	zrn_c2_mark(core, true);
+	cpd = suspended && cluster_prepare(core);
+	if (!zrn_sicd_try(dev, core, suspended, &ret)) {
+		/*
+		 * Not psci_cpu_suspend_enter(): it reads bit 30 of the state
+		 * word to tell retention from power-down, and Samsung's
+		 * 0x10000 has it clear, so it would pass entry point 0 -- and
+		 * a core that powers down resumes through no frame at all
+		 * (seen: the first IRQ lands on a corrupted stack).
+		 * cpu_suspend saves the frame on this stack and our finisher
+		 * hands the firmware cpu_resume's physical address, exactly
+		 * what Samsung's own idle path does.
+		 */
+		ret = cpu_suspend_p(cpd ? 0x01000000 : PSCI_CORE_POWERDOWN,
+				    zrn_suspend_finisher);
+	}
+	if (cpd) {
+		cpd_last_error = ret;
+		if (!ret)
+			cpd_entries++;
+	}
+	zrn_c2_mark(core, false);
 	core_on(core);
 	cpu_pm_exit();
 	return ret ? -EBUSY : idx;
+}
+
+static int enter_powerdown(struct cpuidle_device *dev, struct cpuidle_driver *drv, int idx)
+{
+	return enter_powerdown_common(dev, drv, idx, false);
+}
+
+static int enter_s2idle(struct cpuidle_device *dev, struct cpuidle_driver *drv, int idx)
+{
+	/* The PM core has frozen tasks, suspended devices and stopped ticks.
+	 * cpu_suspend() still owns the RCU/context-tracking transition. */
+	return enter_powerdown_common(dev, drv, idx, true);
 }
 
 static struct cpuidle_driver drivers[2] = {
@@ -181,7 +250,9 @@ static struct cpuidle_driver drivers[2] = {
 			{ .name = "WFI", .desc = "wait for interrupt", .enter = enter_wfi,
 			  .exit_latency = 1, .target_residency = 1 },
 			{ .name = "C2", .desc = "core power down", .enter = enter_powerdown,
-			  .flags = CPUIDLE_FLAG_TIMER_STOP,
+			  .enter_s2idle = enter_s2idle,
+			  /* cpu_suspend() owns the context-tracking transition. */
+			  .flags = CPUIDLE_FLAG_TIMER_STOP | CPUIDLE_FLAG_RCU_IDLE,
 			  .exit_latency = 160, .target_residency = 2000 },
 		},
 		.state_count = 2,
@@ -192,7 +263,8 @@ static struct cpuidle_driver drivers[2] = {
 			{ .name = "WFI", .desc = "wait for interrupt", .enter = enter_wfi,
 			  .exit_latency = 1, .target_residency = 1 },
 			{ .name = "C2", .desc = "core power down", .enter = enter_powerdown,
-			  .flags = CPUIDLE_FLAG_TIMER_STOP,
+			  .enter_s2idle = enter_s2idle,
+			  .flags = CPUIDLE_FLAG_TIMER_STOP | CPUIDLE_FLAG_RCU_IDLE,
 			  .exit_latency = 220, .target_residency = 3500 },
 		},
 		.state_count = 2,
@@ -215,6 +287,8 @@ static void zrn_idle_exit(void)
 		iounmap(bid);
 	if (pmu)
 		iounmap(pmu);
+	if (cluster_mailbox)
+		iounmap(cluster_mailbox);
 }
 
 
@@ -243,6 +317,8 @@ static void zrn_idle_exit(void)
 #define MCT_G_CNT_WSTAT		0x110
 #define MCT_G_COMP0_L		0x200
 #define MCT_G_COMP0_U		0x204
+#define MCT_G_COMP1_L		0x210
+#define MCT_G_COMP1_U		0x214
 #define MCT_G_TCON		0x240
 #define MCT_G_INT_CSTAT		0x244
 #define MCT_G_INT_ENB		0x248
@@ -250,11 +326,19 @@ static void zrn_idle_exit(void)
 #define MCT_TCON_START		(1U << 8)
 #define MCT_TCON_COMP0_EN	(1U << 0)
 #define MCT_G0_SPI		466
+#define MCT_G1_SPI		467 /* Samsung DT mct-map entry 1 */
 
 static void __iomem *mct;
 static struct clock_event_device zrn_bc;
 static unsigned int zrn_bc_irq = ~0U;
 static bool zrn_bc_live;
+static unsigned long zrn_mct_hz;
+static unsigned long mct_late_events;
+module_param(mct_late_events, ulong, 0444);
+static DEFINE_RAW_SPINLOCK(mct_lock);
+static unsigned int alarm_irq = ~0U, alarm_seconds;
+static unsigned long alarm_fires;
+module_param(alarm_fires, ulong, 0444);
 
 static void mct_wr(u32 v, u32 off, u32 wstat_bit)
 {
@@ -298,32 +382,141 @@ static void mct_comp0_stop(void)
 {
 	u32 tcon = readl_relaxed(mct + MCT_G_TCON);
 
-	writel_relaxed(0, mct + MCT_G_INT_ENB);
+	writel_relaxed(readl_relaxed(mct + MCT_G_INT_ENB) & ~1U, mct + MCT_G_INT_ENB);
 	tcon &= ~MCT_TCON_COMP0_EN;
 	mct_wr(tcon, MCT_G_TCON, 1U << 16);
 }
 
 static int zrn_bc_set_next(unsigned long cycles, struct clock_event_device *evt)
 {
-	u64 comp = mct_count() + cycles;
-	u32 tcon = readl_relaxed(mct + MCT_G_TCON);
+	u64 comp;
+	u32 tcon;
+	unsigned long flags;
+	int ret = 0;
+
+	raw_spin_lock_irqsave(&mct_lock, flags);
+	comp = mct_count() + cycles;
+	tcon = readl_relaxed(mct + MCT_G_TCON);
 
 	writel_relaxed(1, mct + MCT_G_INT_CSTAT);
 	tcon &= ~MCT_TCON_COMP0_EN;
 	mct_wr(tcon, MCT_G_TCON, 1U << 16);
 	mct_wr((u32)comp, MCT_G_COMP0_L, 1U << 0);
 	mct_wr((u32)(comp >> 32), MCT_G_COMP0_U, 1U << 1);
-	writel_relaxed(1, mct + MCT_G_INT_ENB);
+	writel_relaxed(readl_relaxed(mct + MCT_G_INT_ENB) | 1U, mct + MCT_G_INT_ENB);
 	tcon |= MCT_TCON_COMP0_EN;
 	mct_wr(tcon, MCT_G_TCON, 1U << 16);
-	return 0;
+	/* MCT compares for equality. If programming took longer than the
+	 * requested interval, the event will never arrive. Returning success
+	 * leaves tick_broadcast_force_mask set and every CPU polling forever.
+	 * Let the clockevent core retry with its minimum-delta backoff. */
+	if ((s64)(mct_count() - comp) >= 0) {
+		mct_comp0_stop();
+		mct_late_events++;
+		ret = -ETIME;
+	}
+	raw_spin_unlock_irqrestore(&mct_lock, flags);
+	return ret;
 }
 
 static int zrn_bc_stop(struct clock_event_device *evt)
 {
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&mct_lock, flags);
 	if (zrn_bc_live)
 		mct_comp0_stop();
+	raw_spin_unlock_irqrestore(&mct_lock, flags);
 	return 0;
+}
+
+/* Comparator 1 is independent of the broadcast clockevent (comparator 0).
+ * It supplies an oscillator-backed, NO_SUSPEND test wakeup even when every
+ * CPU tick and timekeeping have stopped. The IRQ mapping is in Samsung's
+ * firmware DT mct-map: G0=466, G1=467. No alarm is armed at module load. */
+static void alarm_stop_locked(void)
+{
+	writel_relaxed(readl_relaxed(mct + MCT_G_INT_ENB) & ~2U, mct + MCT_G_INT_ENB);
+	mct_wr(readl_relaxed(mct + MCT_G_TCON) & ~BIT(2), MCT_G_TCON, BIT(16));
+	writel_relaxed(2, mct + MCT_G_INT_CSTAT);
+}
+
+static irqreturn_t alarm_interrupt(int irq, void *unused)
+{
+	unsigned long flags;
+
+	if (!(readl_relaxed(mct + MCT_G_INT_CSTAT) & 2))
+		return IRQ_NONE;
+	raw_spin_lock_irqsave(&mct_lock, flags);
+	alarm_stop_locked();
+	alarm_seconds = 0;
+	alarm_fires++;
+	raw_spin_unlock_irqrestore(&mct_lock, flags);
+	pm_system_wakeup();
+	pr_info("zrn-idle: MCT G1 wake alarm fired\n");
+	return IRQ_HANDLED;
+}
+
+static int alarm_set(const char *value, const struct kernel_param *kp)
+{
+	unsigned int seconds;
+	unsigned long flags;
+	u64 target;
+	int ret = kstrtouint(value, 0, &seconds);
+
+	if (ret || seconds > 86400)
+		return ret ? ret : -EINVAL;
+	if (!mct || alarm_irq == ~0U)
+		return -ENODEV;
+	raw_spin_lock_irqsave(&mct_lock, flags);
+	alarm_stop_locked();
+	alarm_seconds = seconds;
+	if (seconds) {
+		target = mct_count() + (u64)seconds * zrn_mct_hz;
+		/* Four write-status bits per comparator (L, U, ADD_INCR, pad). */
+		mct_wr(lower_32_bits(target), MCT_G_COMP1_L, BIT(4));
+		mct_wr(upper_32_bits(target), MCT_G_COMP1_U, BIT(5));
+		writel_relaxed(readl_relaxed(mct + MCT_G_INT_ENB) | 2U, mct + MCT_G_INT_ENB);
+		mct_wr(readl_relaxed(mct + MCT_G_TCON) | BIT(2), MCT_G_TCON, BIT(16));
+	}
+	raw_spin_unlock_irqrestore(&mct_lock, flags);
+	return 0;
+}
+
+static const struct kernel_param_ops alarm_ops = {
+	.set = alarm_set,
+	.get = param_get_uint,
+};
+module_param_cb(alarm_seconds, &alarm_ops, &alarm_seconds, 0600);
+MODULE_PARM_DESC(alarm_seconds, "one-shot hardware wake alarm, 1..86400 s; 0 cancels");
+
+static void __init zrn_alarm_init(struct irq_fwspec *spec)
+{
+	int virq, ret;
+
+	if (readl_relaxed(mct + MCT_G_TCON) & BIT(2)) {
+		pr_warn("zrn-idle: MCT G1 already active; leaving it alone\n");
+		return;
+	}
+	spec->param[1] = MCT_G1_SPI;
+	virq = irq_create_fwspec_mapping(spec);
+	if (virq <= 0)
+		return;
+	ret = request_irq(virq, alarm_interrupt, IRQF_NO_SUSPEND,
+			  "zrn-mct-wake", &alarm_seconds);
+	if (ret)
+		goto dispose;
+	ret = irq_set_irq_wake(virq, 1);
+	if (ret) {
+		free_irq(virq, &alarm_seconds);
+		goto dispose;
+	}
+	irq_set_affinity(virq, cpumask_of(0));
+	alarm_irq = virq;
+	pr_info("zrn-idle: MCT G1 wake alarm on IRQ %d\n", virq);
+	return;
+dispose:
+	irq_dispose_mapping(virq);
 }
 
 static irqreturn_t zrn_bc_isr(int irq, void *dev)
@@ -367,6 +560,7 @@ static int __init zrn_broadcast_init(void)
 		goto err;
 	}
 	pr_info("zrn-idle: MCT G0 at %lu Hz is the broadcast timer\n", rate);
+	zrn_mct_hz = rate;
 
 	gic = of_find_compatible_node(NULL, NULL, "arm,gic-400");
 	if (!gic) {
@@ -403,8 +597,11 @@ static int __init zrn_broadcast_init(void)
 	if (ret)
 		goto err_dispose;
 	zrn_bc_irq = virq;
-	clockevents_config_and_register(&zrn_bc, rate, 0xf, UINT_MAX);
+	/* Several synchronized MMIO writes precede arming the comparator.
+	 * Fifteen cycles (<1 us) can expire before it is enabled. */
+	clockevents_config_and_register(&zrn_bc, rate, DIV_ROUND_UP(rate, 5000), UINT_MAX);
 	zrn_bc_live = true;
+	zrn_alarm_init(&spec);
 	return 0;
 
 err_dispose:
@@ -424,6 +621,17 @@ static void zrn_broadcast_exit(void)
 	if (!zrn_bc_live)
 		return;
 	zrn_bc_live = false;
+	if (alarm_irq != ~0U) {
+		unsigned long flags;
+
+		raw_spin_lock_irqsave(&mct_lock, flags);
+		alarm_stop_locked();
+		raw_spin_unlock_irqrestore(&mct_lock, flags);
+		irq_set_irq_wake(alarm_irq, 0);
+		free_irq(alarm_irq, &alarm_seconds);
+		irq_dispose_mapping(alarm_irq);
+		alarm_irq = ~0U;
+	}
 	free_irq(zrn_bc_irq, &zrn_bc);
 	irq_dispose_mapping(zrn_bc_irq);
 	iounmap(mct);
@@ -459,7 +667,8 @@ static int __init zrn_idle_init(void)
 	}
 	pmu = ioremap(PMU_BASE, 0x8000);
 	bid = ioremap(BID_BASE, 0x1000);
-	if (!pmu || !bid) {
+	cluster_mailbox = ioremap(0x14100000, 0x1000);
+	if (!pmu || !bid || !cluster_mailbox) {
 		zrn_idle_exit();
 		return -ENOMEM;
 	}
@@ -491,6 +700,50 @@ static int __init zrn_idle_init(void)
 	if (ret)
 		zrn_idle_exit();
 	return ret;
+}
+
+/* ---- shared with zrn-sicd.o, the SICD state of the same module --------------- */
+
+/* which cores are down in C2, for SICD's "every online core" gate (vendor:
+ * exynos-powermode.c's c2_mask under c2_lock) */
+DEFINE_RAW_SPINLOCK(zrn_c2_lock);
+unsigned long zrn_c2_mask[BITS_TO_LONGS(NR_CPUS)];
+
+void zrn_c2_mark(unsigned int core, bool down)
+{
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&zrn_c2_lock, flags);
+	if (down)
+		set_bit(core, zrn_c2_mask);
+	else {
+		if (core >= 4 && cluster_down) {
+			rmw(cluster_mailbox + 0x10, BIT(24), 0);
+			wmb();
+			cluster_down = false;
+		}
+		clear_bit(core, zrn_c2_mask);
+	}
+	raw_spin_unlock_irqrestore(&zrn_c2_lock, flags);
+}
+
+void __iomem *zrn_pmu_base(void) { return pmu; }
+void __iomem *zrn_bid_base(void) { return bid; }
+int zrn_cpu_suspend_call(unsigned long state, int (*finisher)(unsigned long))
+{
+	return cpu_suspend_p(state, finisher);
+}
+unsigned long zrn_cpu_resume_pa(void)
+{
+	return cpu_resume_pa;
+}
+u64 zrn_mct_count_now(void)
+{
+	return mct ? mct_count() : 0;
+}
+unsigned long zrn_mct_rate_now(void)
+{
+	return zrn_mct_hz;
 }
 
 module_init(zrn_idle_init);

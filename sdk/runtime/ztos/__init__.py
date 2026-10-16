@@ -30,7 +30,7 @@ import os
 import sys
 import time
 import zipfile
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional, Union
 
 
 from PySide6.QtCore import (QByteArray, QEasingCurve, QEvent, QObject, QPoint, QPointF, QRect, QRectF, Qt, QTimer,
@@ -259,19 +259,53 @@ class _Ticker(QObject):
 
 SLOP = 8                    # points a finger moves before it is a drag, not a tap
 HOLD_MS = 500
+
+
+def _menu_speed() -> float:
+    """The animation speed set in Settings ("Animation speed", a percent): the
+    whole UI runs at it, the shell and every app. (ZTOS_MENU_SPEED overrides,
+    for trying one out.)"""
+    percent = os.environ.get("ZTOS_MENU_SPEED")
+    if not percent:
+        try:
+            with open(os.path.expanduser("~/.config/ztmetro/config")) as f:
+                for line in f:
+                    key, _, value = line.partition("=")
+                    if key.strip() == "menu_speed":
+                        percent = value.strip()
+        except OSError:
+            pass
+    try:
+        return min(300.0, max(25.0, float(percent)))
+    except (TypeError, ValueError):
+        return 75.0             # the default, as on the phone
+
+
+ANIM_SPEED = _menu_speed() / 100.0      # fraction of the toolkit's full speed:
+                                        # every motion of the SDK runs at it
+
+
+def _dur(ms: float) -> float:
+    """A duration of the toolkit's, stretched to the speed the SDK runs at."""
+    return ms / ANIM_SPEED
+
+
 TILT_DEG, TILT_LIFT, PRESS_SINK = 14.0, 40.0, 0.045
-TILT_IN_MS, TILT_OUT_MS = 70, 160
+TILT_IN_MS, TILT_OUT_MS = _dur(70), _dur(160)
 DEPTH_FOV_DEG = 34.0        # the shell's field of view
-ROW_OUT_MS, ROW_IN_MS, ROW_STAGGER_MS, GAP_MS = 110, 180, 33, 120
+ROW_OUT_MS, ROW_IN_MS, ROW_STAGGER_MS, GAP_MS = _dur(110), _dur(180), _dur(33), _dur(120)
 TURN_OUT_DEG = TURN_IN_DEG = 80.0
-ENTER_STAGGER_MS, ENTER_ROW_MS, ENTER_TRAVEL = 28, 190, 50.0
-ENTER_TITLE_TRAVEL, ENTER_TITLE_MS, ENTER_HOLD_MS = 35.0, 200, 60
+ENTER_STAGGER_MS, ENTER_ROW_MS, ENTER_TRAVEL = _dur(28), _dur(190), 50.0
+ENTER_TITLE_TRAVEL, ENTER_TITLE_MS, ENTER_HOLD_MS = 35.0, _dur(200), _dur(60)
 PIVOT_FLICK = 0.3           # points per ms that throw the tabs on to the next
-PIVOT_SPRING_W = 0.018      # per ms: in place in about a quarter second
+PIVOT_SPRING_W = 0.018 * ANIM_SPEED     # per ms: in place in about a quarter second
 ANIM_DPR = 2.0              # pixels per point while things move: a quarter of the work.
                             # Raised per-p picture where it is cheap: the lean of a row
                             # (LEAN_DPR) is drawn native, or its edges look jagged.
 LEAN_DPR = 4.0              # pixels per point for a pressable's flat picture
+FLAT_PIXELS = 160_000       # the most pixels the lean's flat picture may take
+                            # (see _Pressable.leaned: the first press frame stays
+                            # inside the 60 FPS budget on the small cores)
 HEADER_H = 108
 
 
@@ -293,28 +327,41 @@ def _turn(degrees: float, w: float, screen_h: float, y0: float, y1: float) -> QT
 _drawing_pictures = 0       # while the SDK draws pictures, the paints are its own
 
 
-def _snapshot(widget: QWidget, size=None) -> QPixmap:
-    """The widget drawn into a picture at the moving resolution."""
+def _snapshot(widget: QWidget, size=None, dpr: float = 0.0, alpha: bool = False) -> QImage:
+    """The widget drawn into a picture at the moving resolution (`dpr` 0 means
+    ANIM_DPR). With `alpha`, what the widget does not paint stays transparent:
+    for a pressable's flat picture, whose edges the lean lifts off any
+    background."""
     global _drawing_pictures
     size = size or widget.size()
-    pixmap = QPixmap(max(1, round(size.width() * ANIM_DPR)), max(1, round(size.height() * ANIM_DPR)))
-    pixmap.setDevicePixelRatio(ANIM_DPR)
-    pixmap.fill(QColor("black"))
+    if dpr <= 0:
+        dpr = ANIM_DPR
+    image = QImage(max(1, round(size.width() * dpr)), max(1, round(size.height() * dpr)),
+                   QImage.Format_ARGB32_Premultiplied if alpha else QImage.Format_RGB32)
+    image.setDevicePixelRatio(dpr)
+    image.fill(Qt.transparent if alpha else QColor("black"))
     _drawing_pictures += 1
     try:
-        widget.render(pixmap, QPoint(0, 0), QRegion(), QWidget.RenderFlag.DrawChildren |
-                      QWidget.RenderFlag.DrawWindowBackground)
+        # children only: the background stays whatever the widget paints itself
+        # (a pressable's transparent edges stay transparent; a widget that does
+        # not paint its own background would otherwise take the palette's grey)
+        widget.render(image, QPoint(0, 0), QRegion(), QWidget.RenderFlag.DrawChildren)
     finally:
         _drawing_pictures -= 1
-    return pixmap
+    return image
 
 
-def _band(p: QPainter, pixmap: QPixmap, x0: float, y0: float, x1: float, y1: float, dx: float = 0.0):
-    """The part x0..x1, y0..y1 (points) of `pixmap`, moved across by dx."""
+def _band(p: QPainter, picture: Union[QPixmap, QImage], x0: float, y0: float, x1: float, y1: float, dx: float = 0.0):
+    """The part x0..x1, y0..y1 (points) of `picture`, moved across by dx."""
     if x1 <= x0 or y1 <= y0:
         return
-    r = pixmap.devicePixelRatio()
-    p.drawPixmap(QRectF(x0 + dx, y0, x1 - x0, y1 - y0), pixmap, QRectF(x0 * r, y0 * r, (x1 - x0) * r, (y1 - y0) * r))
+    r = picture.devicePixelRatio()
+    target = QRectF(x0 + dx, y0, x1 - x0, y1 - y0)
+    source = QRectF(x0 * r, y0 * r, (x1 - x0) * r, (y1 - y0) * r)
+    if isinstance(picture, QImage):
+        p.drawImage(target, picture, source)
+    else:
+        p.drawPixmap(target, picture, source)
 
 
 class _Moving(QWidget):
@@ -341,7 +388,7 @@ class _Moving(QWidget):
         self.compose(p)
         p.end()
         screen = QPainter(self)
-        screen.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        screen.setRenderHint(QPainter.SmoothPixmapTransform, False)
         screen.drawImage(QRectF(0, 0, w, h), self._frame)
 
 
@@ -354,7 +401,7 @@ def _settle(ms: float = 250.0):
     changes. A change that happened in that moment is not lost: once things are
     still, each page on the screen checks its picture against the widgets."""
     global _settle_until
-    _settle_until = max(_settle_until, _now() + ms)
+    _settle_until = max(_settle_until, _now() + _dur(ms))
     for w in QApplication.topLevelWidgets():
         for page in w.findChildren(Page):
             if page.isVisible():
@@ -375,6 +422,16 @@ def _layer_of(widget: QWidget):
     app = getattr(window, "app", None)
     layer = getattr(app, "gl", None)
     return layer if layer is not None and layer.initialized and not layer.broken else None
+
+
+def _solid(layer, key, color: QColor):
+    """A one-pixel picture of a plain colour, for quads that are rectangles of
+    it (a dim, a thumb). Only away from the paint, where the context is not
+    current: at a motion's begin."""
+    if not layer.has(key):
+        image = QImage(1, 1, QImage.Format_ARGB32_Premultiplied)
+        image.fill(color)
+        layer.upload(key, image)
 
 
 # ---- the finger ----------------------------------------------------------------------
@@ -588,6 +645,7 @@ class _Pressable(QWidget):
         self._p_from = to if at_once else self._amount()
         self._p_to = to
         self._p_start = _now()
+        self._cache = None            # the drawn look changes with the press
         self._ticker.start()
         self.update()
 
@@ -601,17 +659,31 @@ class _Pressable(QWidget):
 
     def _leaning(self) -> bool:
         """Pressed, or easing back from it (or just done): its paints then are motion."""
-        return self._p_to > 0 or _now() - self._p_start < TILT_OUT_MS + 60
+        return self._p_to > 0 or _now() - self._p_start < TILT_OUT_MS + _dur(60)
 
     def _press_step(self, now) -> bool:
+        if self._gl_lean:
+            layer = _layer_of(self)
+            if layer is not None:
+                layer.refresh()     # the GPU leans it: the widget itself stays put
+                keep = now - self._p_start < max(TILT_IN_MS, TILT_OUT_MS)
+                if not keep:
+                    self._lean_end()    # the lean is over: off the GPU
+                    self.update()       # the widget as it is, once, at rest
+                return keep
+            self._gl_lean = False
         self.update()
-        return now - self._p_start < max(TILT_IN_MS, TILT_OUT_MS)
+        keep = now - self._p_start < max(TILT_IN_MS, TILT_OUT_MS)
+        if not keep:
+            self._lean_end()        # the lean is over: off the GPU
+        return keep
 
     def _on_hold(self):
         if self._down is not None and self.receivers(SIGNAL("held()")) > 0:
             self._was_held = True
             haptic("tap")
             self._press_set(0)
+            self._lean_end()
             self._down = None
             self.held.emit()
 
@@ -620,6 +692,7 @@ class _Pressable(QWidget):
         self._down = None
         self._hold.stop()
         self._press_set(0, at_once=True)
+        self._lean_end()
 
     def mousePressEvent(self, event):
         if event.button() != Qt.LeftButton:
@@ -633,6 +706,7 @@ class _Pressable(QWidget):
         self._hold.start()
         if self.height() < self.window().height():     # "anywhere" does not give
             self._press_set(1)
+            self._lean_begin()
 
     mouseDoubleClickEvent = mousePressEvent
 
@@ -644,6 +718,81 @@ class _Pressable(QWidget):
         if tap and self.rect().contains(event.position().toPoint()):
             self.tapped.emit()
 
+    def _make_flat(self) -> QImage:
+        """The widget drawn flat once, for the lean: on the phone's small cores
+        that is about 13.6 thousand pixels a millisecond, so a whole-width row
+        is held under ~12 ms of it by dropping toward the moving resolution; a
+        button (cheap) keeps the full lean resolution."""
+        w, h = float(self.width()), float(self.height())
+        dpr = min(LEAN_DPR, max(ANIM_DPR, (FLAT_PIXELS / max(1.0, w * h)) ** 0.5))
+        self._flat_drawing = True
+        try:
+            return _snapshot(self, dpr=dpr, alpha=True)
+        finally:
+            self._flat_drawing = False
+
+    def _lean_begin(self):
+        """The lean moves on the GPU: the flat picture uploaded once, and the
+        layer tilts it as quads every frame. Without a layer, the paint does
+        the lean itself (see leaned)."""
+        self._gl_lean = False
+        layer = _layer_of(self)
+        if layer is None:
+            return
+        if self._flat is None:
+            self._flat = self._make_flat()
+        layer.upload(("lean", id(self)), self._flat)
+        self._gl_lean = layer.begin(("lean", id(self)), self.window().rect(), self._lean_quads)
+
+    def _lean_end(self):
+        if self._gl_lean:
+            self._gl_lean = False
+            layer = _layer_of(self)
+            if layer is not None:
+                layer.end(("lean", id(self)))
+
+    def _lean_quads(self) -> list:
+        """One frame of the lean: the flat picture's cells, each a quad placed
+        where its corners fall seen from in front of the widget."""
+        from ._gl import Quad
+        p = self._amount()
+        if p <= 0.001 or self._flat is None:
+            return []
+        w, h = float(self.width()), float(self.height())
+        at = self.mapTo(self.window(), QPoint(0, 0))
+        ox, oy = float(at.x()), float(at.y())
+        eye = _eye(self.window().height() or 640)
+        most = math.radians(TILT_DEG)
+        ay = min(most, math.asin(min(1.0, TILT_LIFT / (w / 2))))
+        ax = min(most, math.asin(min(1.0, TILT_LIFT / (h / 2))))
+        ry, rx = (self._fx - 0.5) * 2 * ay * p, (self._fy - 0.5) * 2 * ax * p
+        z0 = -PRESS_SINK * eye * p
+        sy, cy_, sx, cx_ = math.sin(ry), math.cos(ry), math.sin(rx), math.cos(rx)
+
+        def at_(X, Y):          # a point of the widget (from its middle), as seen
+            den = eye - z0 + X * sy + Y * sx
+            return w / 2 + eye * cy_ * X / den, h / 2 + eye * cx_ * Y / den
+        key = ("lean", id(self))
+        fw, fh = float(self._flat.width()), float(self._flat.height())
+        quads = []
+        nx, ny = 10, 3
+        for i in range(nx):
+            for j in range(ny):
+                X0, X1 = (i / nx - 0.5) * w, ((i + 1) / nx - 0.5) * w
+                Y0, Y1 = (j / ny - 0.5) * h, ((j + 1) / ny - 0.5) * h
+                pts = (at_(X0, Y0), at_(X1, Y0), at_(X0, Y1), at_(X1, Y1))
+                left, right = min(q[0] for q in pts), max(q[0] for q in pts)
+                top, bottom = min(q[1] for q in pts), max(q[1] for q in pts)
+                if right - left < 0.05 or bottom - top < 0.05:
+                    continue
+                corners = ((ox + left - 0.25, oy + top - 0.25, 1.0),
+                           (ox + right + 0.25, oy + top - 0.25, 1.0),
+                           (ox + left - 0.25, oy + bottom + 0.25, 1.0),
+                           (ox + right + 0.25, oy + bottom + 0.25, 1.0))
+                src = QRectF((X0 + w / 2) / w, (Y0 + h / 2) / h, (X1 - X0) / w, (Y1 - Y0) / h)
+                quads.append(Quad(key, src, corners))
+        return quads
+
     def leaned(self, painter: QPainter) -> bool:
         """While pressed: draws the widget leaning, and returns True (its paint
         code then draws nothing itself). Text drawn in perspective is rebuilt
@@ -651,16 +800,16 @@ class _Pressable(QWidget):
         every tap; so, as the toolkit does it, the widget is drawn flat once into
         a picture, and that is laid down in a grid of small cells, each placed
         where its corners fall seen from in front of the widget: plain scaled
-        copies, quick."""
+        copies, quick. On the GPU the layer does this (see _lean_begin) and the
+        paint only copies the widget as it is."""
         p = self._amount()
-        if p <= 0.001 or self._flat_drawing:
+        if p <= 0.001 or self._flat_drawing or self._gl_lean:
             return False
-        if self._flat is None or self._flat.size() != self.size() * LEAN_DPR:
-            self._flat_drawing = True
-            try:
-                self._flat = _snapshot(self)
-            finally:
-                self._flat_drawing = False
+        w, h = float(self.width()), float(self.height())
+        if self._flat is None or (self._flat.width(), self._flat.height()) != \
+                (max(1, round(w * min(LEAN_DPR, max(ANIM_DPR, (FLAT_PIXELS / max(1.0, w * h)) ** 0.5)))),
+                 max(1, round(h * min(LEAN_DPR, max(ANIM_DPR, (FLAT_PIXELS / max(1.0, w * h)) ** 0.5))))):
+            self._flat = self._make_flat()
         w, h = float(self.width()), float(self.height())
         eye = _eye(self.window().height() or 640)
         most = math.radians(TILT_DEG)
@@ -675,7 +824,7 @@ class _Pressable(QWidget):
             return w / 2 + eye * cy_ * X / den, h / 2 + eye * cx_ * Y / den
         nx, ny = 10, 3
         r = self._flat.devicePixelRatio()
-        painter.fillRect(self.rect(), QColor("black"))
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         for i in range(nx):
             for j in range(ny):
                 X0, X1 = (i / nx - 0.5) * w, ((i + 1) / nx - 0.5) * w
@@ -683,13 +832,18 @@ class _Pressable(QWidget):
                 pts = (at(X0, Y0), at(X1, Y0), at(X0, Y1), at(X1, Y1))
                 left, right = min(q[0] for q in pts), max(q[0] for q in pts)
                 top, bottom = min(q[1] for q in pts), max(q[1] for q in pts)
-                painter.drawPixmap(QRectF(left - 0.25, top - 0.25, right - left + 0.5, bottom - top + 0.5), self._flat,
-                                   QRectF((X0 + w / 2) * r, (Y0 + h / 2) * r, (X1 - X0) * r, (Y1 - Y0) * r))
+                target = QRectF(left - 0.25, top - 0.25, right - left + 0.5, bottom - top + 0.5)
+                source = QRectF((X0 + w / 2) * r, (Y0 + h / 2) * r, (X1 - X0) * r, (Y1 - Y0) * r)
+                if isinstance(self._flat, QImage):
+                    painter.drawImage(target, self._flat, source)
+                else:
+                    painter.drawPixmap(target, self._flat, source)
         return True
 
     _fx = _fy = 0.5
-    _flat: Optional[QPixmap] = None     # the widget drawn flat, for the lean
+    _flat: Optional[Union[QPixmap, QImage]] = None     # the widget drawn flat, for the lean
     _flat_drawing = False
+    _gl_lean = False        # the lean is on the GPU layer (the paint then leaves it alone)
     _cache: Optional[QPixmap] = None    # the widget as drawn, at the screen's resolution
 
     def draw(self, p: QPainter):
@@ -699,6 +853,11 @@ class _Pressable(QWidget):
         """What it shows changed: drawn again at the next paint."""
         self._cache = None
         self._flat = None
+        if self._gl_lean:
+            self._lean_end()        # the flat picture on the GPU is out of date too
+        layer = _layer_of(self)
+        if layer is not None:
+            layer.drop(("lean", id(self)))
         self.update()
 
     def paintEvent(self, event):
@@ -768,24 +927,60 @@ class Entry(_Pressable):
 class Toggle(_Pressable):
     """A title with an on/off switch at the right, and "On"/"Off" under it."""
     changed = Signal(bool)
+    _gl_switch = False      # the switch's motion is on the GPU layer
 
     def __init__(self, title: str, on: bool = False, on_change: Optional[Callable[[bool], None]] = None,
                  states: tuple = ("Off", "On"), parent=None):
         super().__init__(parent)
         self._title, self._on, self._states = title, on, states
         self._pos = 1.0 if on else 0.0
-        self._anim = QVariantAnimation(self, duration=130, easingCurve=QEasingCurve.OutCubic)
+        self._anim = QVariantAnimation(self, duration=int(_dur(130)), easingCurve=QEasingCurve.OutCubic)
         self._anim.valueChanged.connect(self._moved)
-        self._anim.finished.connect(self.content_changed)
+        self._anim.finished.connect(self._switch_settled)
         self.setFixedHeight(59)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.tapped.connect(lambda: self.set_on(not self._on, user=True))
         if on_change:
             self.changed.connect(on_change)
 
+    def _switch_settled(self):
+        self._switch_end()
+        self.update()               # the row, with the switch in place
+        self.content_changed()
+
     def _moved(self, value):
         self._pos = float(value)
-        self.redraw()               # the switch moved (the lean shows it where it is too)
+        # the switch moves: its two rectangles go to the GPU (the row's own
+        # picture, text and frame, stays as it is) where there is a layer; the
+        # paint then only lays the row down. Elsewhere the paint draws them too.
+        layer = _layer_of(self)
+        if not self._gl_switch and layer is not None and self.isVisible():
+            _solid(layer, ("sys", "accent"), accent())
+            _solid(layer, ("sys", "white"), QColor("white"))
+            self._gl_switch = layer.begin(("switch", id(self)), self.window().rect(), self._switch_quads)
+        if self._gl_switch:
+            layer = _layer_of(self)
+            if layer is not None:
+                layer.refresh()
+                return
+            self._gl_switch = False
+        self.update()               # the row, with the switch where it is now
+
+    def _switch_quads(self) -> list:
+        from ._gl import Quad
+        at = self.mapTo(self.window(), QPoint(0, 0))
+        ox, oy = float(at.x()), float(at.y())
+        x, y = ox + self.width() - 54, oy + 8
+        whole = _WHOLE
+        return [Quad.rect(("sys", "accent"), whole, x + 4, y + 4, 46 * self._pos, 16),
+                Quad.rect(("sys", "white"), whole, x + 1 + 40 * self._pos, y - 1, 12, 26)]
+
+    def _switch_end(self):
+        if self._gl_switch:
+            self._gl_switch = False
+            layer = _layer_of(self)
+            if layer is not None:
+                layer.end(("switch", id(self)))
 
     def is_on(self) -> bool:
         return self._on
@@ -812,12 +1007,20 @@ class Toggle(_Pressable):
         p.setPen(GREY)
         p.setFont(_font(FONT_REGULAR, 12))
         p.drawText(QPointF(0, 31 + QFontMetricsF(p.font()).ascent()), self._states[1 if self._on else 0])
-        # the switch: a frame, the accent inside it when on, a white thumb
+        # the switch's frame: what moves (the accent in it and the thumb) the
+        # paint lays over this, or the GPU does
         x, y = w - 54, 8
         p.setPen(QPen(QColor("white"), 2))
         p.setBrush(Qt.NoBrush)
         p.drawRect(QRectF(x + 1, y + 1, 52, 22))
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._gl_switch:
+            return                  # the GPU draws the accent and the thumb
+        p = QPainter(self)
         p.setPen(Qt.NoPen)
+        x, y = self.width() - 54, 8
         if self._pos > 0:
             p.setBrush(accent())
             p.drawRect(QRectF(x + 4, y + 4, 46 * self._pos, 16))
@@ -1311,7 +1514,9 @@ class Page(QWidget):
             self._gl_idle.start()
             return
         self._gl_on = True
-        layer.show(QRect(self.viewport.mapTo(self.window(), QPoint(0, 0)), self.viewport.size()), self._gl_quads)
+        at = self.viewport.mapTo(self.window(), QPoint(0, 0))
+        self._gl_ox, self._gl_oy = float(at.x()), float(at.y())
+        layer.begin("scroll", self.window().rect(), self._gl_quads)
         self.viewport.setUpdatesEnabled(False)
 
     def _gl_quads(self) -> list:
@@ -1322,7 +1527,7 @@ class Page(QWidget):
         if c1 <= c0:
             return []
         return [Quad.rect((id(self), "list"), QRectF(0, c0 / self._gl_h, 1, (c1 - c0) / self._gl_h),
-                          0, c0 - s0, w, c1 - c0)]
+                          self._gl_ox, self._gl_oy + c0 - s0, w, c1 - c0)]
 
     def _gl_end(self):
         """Still again: the widgets themselves, where the picture was."""
@@ -1337,7 +1542,7 @@ class Page(QWidget):
         self._quiet = False
         layer = _layer_of(self)
         if layer is not None:
-            layer.hide()
+            layer.end("scroll")
 
     def _fit(self):
         w, view_h = self.viewport.width(), self.viewport.height()
@@ -1593,7 +1798,7 @@ class Pivot(QWidget):
     def _at(self, k: int) -> int:
         return (self.index + k) % len(self.pages)
 
-    def _snap(self, i: int) -> QPixmap:
+    def _snap(self, i: int) -> QImage:
         page = self.pages[i]
         if page.size() != self._area.size():
             page.setGeometry(self._area.rect())
@@ -1603,7 +1808,7 @@ class Pivot(QWidget):
         self._snap_at[i] = (page._version, page._scroll)
         layer = _layer_of(self)
         if layer is not None:
-            layer.upload((id(self), i), picture.toImage())
+            layer.upload((id(self), i), picture.toImage() if hasattr(picture, "toImage") else picture)
         return picture
 
     def _current_snap(self, i: int) -> bool:
@@ -1653,11 +1858,13 @@ class Pivot(QWidget):
         (each its own picture, dimmed as it should be) and the tabs."""
         from ._gl import Quad
         w, h = float(self._area.width()), float(self._area.height())
+        ox, oy = getattr(self, "_gl_ox", 0.0), getattr(self, "_gl_oy", 0.0)
         u = -self._x / w
         k0 = math.floor(u)
         whole = _WHOLE
         cw, ch = self._caps_size
-        quads = [Quad.rect((id(self), "caps"), whole, MARGIN, 14, cw, ch)]
+        quads = [Quad.rect(("sys", "black"), whole, ox, oy, w, h),
+                 Quad.rect((id(self), "caps"), whole, ox + MARGIN, oy + 14, cw, ch)]
         width = self._widths.__getitem__
         a, b = self._title_pos(k0, width), self._title_pos(k0 + 1, width)
         strip = a + (u - k0) * (b - a)
@@ -1668,10 +1875,10 @@ class Pivot(QWidget):
                 continue
             tw, th = self._title_sizes[i]
             light = _clamp01((w * 0.5 + 30 - abs(u - k) * w) / 60)
-            quads.append(Quad.rect((id(self), "title", i), whole, at, 24, tw, th, 0.38 + 0.62 * light))
+            quads.append(Quad.rect((id(self), "title", i), whole, ox + at, oy + 24, tw, th, 0.38 + 0.62 * light))
         top = float(self._titles.height())
         for k in (k0, k0 + 1):
-            quads.append(Quad.rect((id(self), self._at(k)), whole, self._x + k * w, top, w, h))
+            quads.append(Quad.rect((id(self), self._at(k)), whole, ox + self._x + k * w, oy + top, w, h))
         return quads
 
     def _prepare_neighbours(self):
@@ -1697,7 +1904,10 @@ class Pivot(QWidget):
         layer = _layer_of(self)
         if layer is not None:
             self._prepare_titles()  # the titles' pictures, made before the first frame
-            layer.show(QRect(self.mapTo(self.window(), QPoint(0, 0)), self.size()), self._quads)
+            at = self.mapTo(self.window(), QPoint(0, 0))
+            self._gl_ox, self._gl_oy = float(at.x()), float(at.y())
+            _solid(layer, ("sys", "black"), QColor(0, 0, 0))
+            layer.begin("pivot", self.window().rect(), self._quads)
             self.setUpdatesEnabled(False)   # under the layer: nothing to repaint until it goes
         else:
             self._motion.setGeometry(self._area.geometry())
@@ -1767,7 +1977,7 @@ class Pivot(QWidget):
             self.setUpdatesEnabled(True)
             self.repaint()              # the tab as it is, before the pictures go
             page._quiet = False
-            layer.hide()
+            layer.end("pivot")
         self._titles.update()
         if k % len(self.pages) != 0:
             self.turned.emit(self.index)
@@ -1936,7 +2146,8 @@ def _rows_ms(bands: list, row_ms: float, stagger: float = ROW_STAGGER_MS) -> flo
 
 
 class _Turnstile(_Moving):
-    def __init__(self, host: QWidget, before: Optional[QPixmap], out_rows: list, after: Optional[QPixmap],
+    def __init__(self, host: QWidget, before: Optional[Union[QPixmap, QImage]], out_rows: list,
+                 after: Optional[Union[QPixmap, QImage]],
                  in_rows: list, back: bool, entrance: bool = False, start: Optional[float] = None,
                  done: Optional[Callable] = None):
         super().__init__(host)
@@ -1955,17 +2166,15 @@ class _Turnstile(_Moving):
         self.start = start if start is not None else _now()
         self.ms = 0.0
         self.ticker = _Ticker(self, self._step)
-        # Drawn by the CPU for now: a GPU layer over the whole window is not put
-        # on the screen by the shell (on the phone, recorded: the entrance played
-        # unseen), where one over part of it (the tabs) is. Until that is found,
-        # whole-window turns are drawn here, at half resolution, in strips.
-        self.layer = None
+        self.layer = _layer_of(host)
         if self.layer is not None:
+            _solid(self.layer, ("sys", "black"), QColor(0, 0, 0))
             for which, picture in (("before", before), ("after", after)):
                 if picture is not None:
-                    self.layer.upload((id(self), which), picture.toImage())
+                    img = picture.toImage() if hasattr(picture, "toImage") else picture
+                    self.layer.upload((id(self), which), img)
             self.setAttribute(Qt.WA_TransparentForMouseEvents)
-            self.layer.show(host.rect(), self.quads)
+            self.layer.begin("turn", host.rect(), self.quads)
         else:
             self.show()
             self.raise_()
@@ -1992,7 +2201,7 @@ class _Turnstile(_Moving):
         _settle()
         self.ticker.stop()
         if self.layer is not None:
-            self.layer.hide()
+            self.layer.end("turn")
             self.layer.drop((id(self), "before"))
             self.layer.drop((id(self), "after"))
         self.hide()
@@ -2040,37 +2249,39 @@ class _Turnstile(_Moving):
     def quads(self) -> list:
         """The same frame for the GPU: each row one quad, turned in true perspective."""
         from ._gl import Quad
-        w, h = float(self.width()), float(self.height())
-        d = _eye(h)
-        out = []
+        w = float(self.width()) if self.width() > 1 else float(self.parent().width())
+        h = float(self.height()) if self.height() > 1 else float(self.parent().height())
+        # a page turn fills the window: black behind the rows, as it always showed
+        out = [Quad.rect(("sys", "black"), _WHOLE, 0.0, 0.0, w, h)]
         for which, y0, y1, degrees, alpha, travel in self._plan():
-            a = math.radians(degrees)
-            sa, ca = math.sin(a), math.cos(a)
-            cx, cy = w / 2.0, (y0 + y1) / 2.0
-            corners = []
-            for x, y in ((0.0, y0), (w, y0), (0.0, y1), (w, y1)):
-                den = (d + x * sa) / d
-                corners.append((x * (cx * sa + d * ca) / d + travel * den, (x * cy * sa + d * y) / d, den))
+            from ._native import turn, entrance
+            depth = 0.0
+            if self.entrance and which == "after":
+                order = next(order for row0, row1, order in self.in_rows if row0 == y0 and row1 == y1)
+                life = ENTER_TITLE_MS if y0 < 1 else ENTER_ROW_MS
+                t = _clamp01((self.ms - self.in_start - order * ENTER_STAGGER_MS) / life)
+                degrees, depth, travel, alpha = entrance(t, h)
+            corners = turn(w, h, y0, y1, degrees, travel, depth)
             out.append(Quad((id(self), which), QRectF(0, y0 / h, 1, (y1 - y0) / h), corners, alpha))
         return out
 
     @staticmethod
-    def _row(p: QPainter, pixmap: QPixmap, y0, y1, degrees, alpha, travel, w, h):
-        if alpha <= 0.01:
+    def _row(p: QPainter, picture: Union[QPixmap, QImage], y0, y1, degrees, alpha, travel, w, h):
+        if alpha <= 0.01 or picture is None:
             return
         p.save()
         p.setOpacity(min(1.0, alpha))
         if abs(degrees) < 0.05:
-            _band(p, pixmap, 0, y0, w, y1, round(travel))
+            _band(p, picture, 0, y0, w, y1, round(travel))
         else:
-            _turned_strip(p, pixmap, y0, y1, degrees, w, h, travel)
+            _turned_strip(p, picture, y0, y1, degrees, w, h, travel)
         p.restore()
 
 
 SLICES = 16
 
 
-def _turned_strip(p: QPainter, pixmap: QPixmap, y0: float, y1: float, degrees: float, w: float, h: float,
+def _turned_strip(p: QPainter, picture: Union[QPixmap, QImage], y0: float, y1: float, degrees: float, w: float, h: float,
                   travel: float = 0.0):
     """A band of the page turned round its left edge, seen from in front of the
     screen's middle (across) and its own middle (up and down): as the toolkit
@@ -2080,7 +2291,8 @@ def _turned_strip(p: QPainter, pixmap: QPixmap, y0: float, y1: float, degrees: f
     d = _eye(h)
     cx, cy = w / 2.0, (y0 + y1) / 2.0
     sa, ca = math.sin(a), math.cos(a)
-    r = pixmap.devicePixelRatio()
+    r = picture.devicePixelRatio()
+    is_img = isinstance(picture, QImage)
     for k in range(SLICES):
         x0, x1 = w * k / SLICES, w * (k + 1) / SLICES
         xm = (x0 + x1) / 2
@@ -2089,8 +2301,12 @@ def _turned_strip(p: QPainter, pixmap: QPixmap, y0: float, y1: float, degrees: f
         if px1 - px0 < 0.05 or sm <= 0:
             continue        # edge on
         top = cy - (cy - y0) * sm
-        p.drawPixmap(QRectF(px0 + travel, top, px1 - px0, (y1 - y0) * sm), pixmap,
-                     QRectF(x0 * r, y0 * r, (x1 - x0) * r, (y1 - y0) * r))
+        target = QRectF(px0 + travel, top, px1 - px0, (y1 - y0) * sm)
+        source = QRectF(x0 * r, y0 * r, (x1 - x0) * r, (y1 - y0) * r)
+        if is_img:
+            p.drawImage(target, picture, source)
+        else:
+            p.drawPixmap(target, picture, source)
 
 
 # ---- the app -----------------------------------------------------------------------------
@@ -2181,7 +2397,7 @@ class App:
             return False
         return self._turn is not None
 
-    def _snap(self) -> QPixmap:
+    def _snap(self) -> QImage:
         return _snapshot(self.window)
 
     def _turnstile(self, before, out_rows, after, in_rows, back, entrance=False, start=None, done=None):
@@ -2289,6 +2505,7 @@ class App:
         self._cover.setGeometry(self.window.rect())
         self._cover.raise_()
         self.window.show()
+        self._make_gl()
         self._entrance_due = True
         self._arrived(first)
         shot = os.environ.get("ZTOS_SHOT")
@@ -2362,7 +2579,6 @@ class App:
         # (on the GPU it stays hidden: the layer draws the black itself, and a
         # widget raised over a window container is given a surface of its own
         # by Qt, above the layer: the entrance played unseen under it)
-        start = None                     # now: the shell uncovers the window as it hears "ready"
         _ctl(f"ready ztos.{self.id}")
 
         def uncover():
@@ -2452,6 +2668,8 @@ class LoadingDots(QWidget):
     """The phone's loading dots: five of them cross from the left, quick at the
     edges and slow through the middle, then a pause (as the toolkit's)."""
 
+    _gl_dots = False        # the dots run on the GPU layer while shown
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._motion = True         # its paints are motion, not a change of the page
@@ -2463,15 +2681,59 @@ class LoadingDots(QWidget):
     def showEvent(self, event):
         self._since = _now()
         self._ticker.start()
+        self._dots_begin()
 
     def hideEvent(self, event):
         self._ticker.stop()
+        self._dots_end()
+
+    def _dots_begin(self):
+        """The dots cross on the GPU: the layer runs while they are shown (they
+        and any other motion of the app share it). Without a layer, the paint
+        draws them."""
+        self._gl_dots = False
+        layer = _layer_of(self)
+        if layer is None:
+            return
+        _solid(layer, ("sys", "black"), QColor(0, 0, 0))
+        _solid(layer, ("sys", "accent"), accent())
+        self._gl_dots = layer.begin(("dots", id(self)), self.window().rect(), self._dots_quads)
+
+    def _dots_end(self):
+        if self._gl_dots:
+            self._gl_dots = False
+            layer = _layer_of(self)
+            if layer is not None:
+                layer.end(("dots", id(self)))
+
+    def _dots_quads(self) -> list:
+        from ._gl import Quad
+        at = self.mapTo(self.window(), QPoint(0, 0))
+        ox, oy = float(at.x()), float(at.y())
+        w, h = float(self.width()), float(self.height())
+        t = (_now() - self._since) % 2600
+        quads = [Quad.rect(("sys", "black"), _WHOLE, ox, oy, w, h)]
+        for i in range(5):
+            k = (t - i * 160) / 1700.0
+            if 0 < k < 1:
+                u = 2 * k - 1
+                x = w * (0.5 + 0.5 * (0.25 * u + 0.75 * u * u * u))
+                quads.append(Quad.rect(("sys", "accent"), _WHOLE, ox + x - 1.5, oy + 3, 3, 3))
+        return quads
 
     def _tick(self, now) -> bool:
+        if self._gl_dots:
+            layer = _layer_of(self)
+            if layer is not None:
+                layer.refresh()
+                return self.isVisible()
+            self._gl_dots = False
         self.update()
         return self.isVisible()
 
     def paintEvent(self, event):
+        if self._gl_dots:
+            return                  # the GPU draws the dots (the paint stays black)
         p = QPainter(self)
         t = (_now() - self._since) % 2600
         color = accent()
@@ -2507,13 +2769,16 @@ class ProgressBar(QWidget):
     """A thin bar in the accent colour. set_value() glides to the new value
     (quick, then easing); with no value (indeterminate) it shows the dots."""
 
+    _gl_bar = False             # the bar's glide is on the GPU layer
+    _caps_size = (0, 0)         # the caption's picture, once the GPU has it
+
     def __init__(self, value: Optional[float] = 0, maximum: float = 100, caption: str = "", parent=None):
         super().__init__(parent)
         self._motion = True
         self._max = float(maximum) or 1.0
         self._caption = caption
         self._shown = 0.0           # 0..1 as drawn
-        self._anim = QVariantAnimation(self, duration=320, easingCurve=QEasingCurve.OutCubic)
+        self._anim = QVariantAnimation(self, duration=int(_dur(320)), easingCurve=QEasingCurve.OutCubic)
         self._anim.valueChanged.connect(self._moved)
         self._anim.finished.connect(self._settled)
         layout = QVBoxLayout(self)
@@ -2550,14 +2815,81 @@ class ProgressBar(QWidget):
 
     def _moved(self, v):
         self._shown = float(v)
+        # the bar glides on the GPU: its three pieces (the caption as a picture,
+        # the track, the accent) are quads where there is a layer. Elsewhere the
+        # paint draws them.
+        layer = _layer_of(self)
+        if not self._gl_bar and layer is not None and self.isVisible():
+            _solid(layer, ("sys", "black"), QColor(0, 0, 0))
+            _solid(layer, ("sys", "track"), QColor(56, 56, 56))
+            _solid(layer, ("sys", "accent"), accent())
+            if self._caption and not layer.has(("bar", id(self), "caps")):
+                self._upload_caption(layer)
+            self._gl_bar = layer.begin(("bar", id(self)), self.window().rect(), self._bar_quads)
+        if self._gl_bar:
+            layer = _layer_of(self)
+            if layer is not None:
+                layer.refresh()
+                return
+            self._gl_bar = False
         self.update()
 
+    def _upload_caption(self, layer):
+        """The caption as one picture, so a frame is only quads."""
+        fm = QFontMetricsF(_font(FONT_REGULAR, 13))
+        dpr = self.devicePixelRatioF() or 1.0
+        size = QSize(max(1, round(fm.horizontalAdvance(self._caption) * dpr) + 2),
+                     max(1, round(fm.height() * dpr) + 2))
+        image = QImage(size, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        image.setDevicePixelRatio(dpr)
+        p = QPainter(image)
+        p.setPen(GREY)
+        p.setFont(_font(FONT_REGULAR, 13))
+        p.drawText(QPointF(1, fm.ascent() + 1), self._caption)
+        p.end()
+        layer.upload(("bar", id(self), "caps"), image)
+        self._caps_size = (image.width(), image.height())
+
+    def _bar_quads(self) -> list:
+        from ._gl import Quad
+        at = self.mapTo(self.window(), QPoint(0, 0))
+        ox, oy = float(at.x()), float(at.y())
+        w = float(self.width())
+        y = oy + self.height() - 8.0
+        dpr = self.devicePixelRatioF() or 1.0
+        cw, ch = self._caps_size
+        quads = [Quad.rect(("bar", id(self), "caps"), _WHOLE, ox + 1, oy + 1, cw / dpr, ch / dpr),
+                 Quad.rect(("sys", "track"), _WHOLE, ox, y, w, 4),
+                 Quad.rect(("sys", "accent"), _WHOLE, ox, y, w * self._shown, 4)]
+        return quads
+
+    def _bar_end(self):
+        if self._gl_bar:
+            self._gl_bar = False
+            layer = _layer_of(self)
+            if layer is not None:
+                layer.end(("bar", id(self)))
+
     def _settled(self):
+        self._bar_end()
         page = _ancestor(self.parentWidget(), Page)
         if page is not None:
             page._changed(explicit=True)    # its picture shows the value it came to
 
+    def set_caption(self, text: str):
+        """What the bar says over it (a word like "downloading")."""
+        self._caption = text
+        layer = _layer_of(self)
+        if layer is not None and layer.has(("bar", id(self), "caps")):
+            self._upload_caption(layer)
+            if self._gl_bar:
+                layer.refresh()
+        self.update()
+
     def paintEvent(self, event):
+        if self._gl_bar:
+            return                  # the GPU draws the bar and its caption
         p = QPainter(self)
         w = float(self.width())
         y = self.height() - 8.0
@@ -2617,33 +2949,83 @@ class Dialog(QWidget):
         self.panel.setFixedWidth(self.width())
         self.panel.adjustSize()
         self.panel.move(0, 0)
-        self._anim = QVariantAnimation(self, startValue=0.0, endValue=1.0, duration=260,
+        self._anim = QVariantAnimation(self, startValue=0.0, endValue=1.0, duration=int(_dur(260)),
                                        easingCurve=QEasingCurve.OutCubic)
         self._anim.valueChanged.connect(self._step)
         self._closing = False
         app._dialogs.append(self)
         haptic("tap")
         self._picture = _snapshot(self.panel, self.panel.size())
+        self._gl_on = False
+        layer = _layer_of(self)
+        if layer is not None:
+            if not layer.has(("sys", "black")):
+                black = QImage(1, 1, QImage.Format_ARGB32_Premultiplied)
+                black.fill(QColor(0, 0, 0))
+                layer.upload(("sys", "black"), black)
+            layer.upload(("dialog", id(self)), self._picture)
+            self._gl_on = layer.begin(("dialog", id(self)), self.rect(), self._gl_quads)
         self.panel.hide()               # drawn as a picture while it swings
         self.show()
         self.raise_()
         self._anim.finished.connect(self._arrived)
         self._anim.start()
 
+    def _gl_quads(self) -> list:
+        """One frame of the swing, all of it the GPU's: a dim over the page, and
+        the panel turned about its top edge in bands (as the paint draws it)."""
+        from ._gl import Quad
+        w, h = float(self.width()), float(self.height())
+        quads = [Quad.rect(("sys", "black"), _WHOLE, 0.0, 0.0, w, h, 160.0 / 255.0 * self._dim)]
+        if self._picture is None or self.panel.isVisible():
+            return quads
+        a = math.radians(self._angle)
+        ph = float(self.panel.height())
+        d = _eye(h)
+        key = ("dialog", id(self))
+        seen = min(1.0, self._dim * 1.5)
+        for k in range(12):
+            y0, y1 = ph * k / 12, ph * (k + 1) / 12
+            s0, s1 = d / (d - y0 * math.sin(a)), d / (d - y1 * math.sin(a))
+            top, bottom = y0 * math.cos(a) * s0, y1 * math.cos(a) * s1
+            if bottom - top < 0.05:
+                continue
+            sm = (s0 + s1) / 2
+            quads.append(Quad.rect(key, QRectF(0.0, y0 / ph, 1.0, (y1 - y0) / ph),
+                                   w / 2 - w / 2 * sm, top, w * sm, bottom - top, seen))
+        return quads
+
+    def _gl_end(self):
+        if self._gl_on:
+            self._gl_on = False
+            layer = _layer_of(self)
+            if layer is not None:
+                layer.end(("dialog", id(self)))
+                layer.drop(("dialog", id(self)))
+
     def _step(self, t):
         t = float(t)
         self._dim = t if not self._closing else 1 - t
         self._angle = -90.0 * (1 - t) if not self._closing else -70.0 * t
-        self.update()
+        if self._gl_on:
+            layer = _layer_of(self)
+            if layer is not None:
+                layer.refresh()
+            else:
+                self._gl_end()
+        else:
+            self.update()
 
     def _arrived(self):
         if self._closing:
+            self._gl_end()
             self.hide()
             self.deleteLater()
             if self in self.app._dialogs:
                 self.app._dialogs.remove(self)
             self.finished.emit(self._result)
             return
+        self._gl_end()
         self.panel.show()               # the real one, with its buttons, now it is still
         self.update()
 
@@ -2654,9 +3036,14 @@ class Dialog(QWidget):
         self._closing = True
         self._result = result
         self._picture = _snapshot(self.panel, self.panel.size())
+        layer = _layer_of(self)
+        if layer is not None:
+            layer.upload(("dialog", id(self)), self._picture)
+            if not self._gl_on:
+                self._gl_on = layer.begin(("dialog", id(self)), self.rect(), self._gl_quads)
         self.panel.hide()
         self._anim.stop()
-        self._anim.setDuration(170)
+        self._anim.setDuration(int(_dur(170)))
         self._anim.setEasingCurve(QEasingCurve.InCubic)
         self._anim.start()
 
@@ -2665,6 +3052,8 @@ class Dialog(QWidget):
             self.close_with(None)
 
     def paintEvent(self, event):
+        if self._gl_on:
+            return                  # the GPU draws the swing
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(0, 0, 0, int(160 * self._dim)))
         if self.panel.isVisible() or self._picture is None:
@@ -2685,8 +3074,12 @@ class Dialog(QWidget):
                 continue
             sm = (s0 + s1) / 2
             x0 = w / 2 - w / 2 * sm
-            p.drawPixmap(QRectF(x0, top, w * sm, bottom - top), self._picture,
-                         QRectF(0, y0 * r, w * r, (y1 - y0) * r))
+            target = QRectF(x0, top, w * sm, bottom - top)
+            source = QRectF(0, y0 * r, w * r, (y1 - y0) * r)
+            if isinstance(self._picture, QImage):
+                p.drawImage(target, self._picture, source)
+            else:
+                p.drawPixmap(target, self._picture, source)
 
 
 def message(title: str, text: str = "", buttons: Iterable[str] = ("ok",),
@@ -2840,10 +3233,10 @@ def _install_profiler(app: "App"):
         pass
     plain = _snapshot
 
-    def timed_snapshot(widget, size=None):
+    def timed_snapshot(widget, size=None, **kwargs):
         t = time.perf_counter()
         try:
-            return plain(widget, size)
+            return plain(widget, size, **kwargs)
         finally:
             entry = prof.setdefault("_snapshot", [0, 0.0, 0.0])
             entry[0] += 1

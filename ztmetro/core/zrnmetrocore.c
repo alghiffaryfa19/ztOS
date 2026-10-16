@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * ZrnMetroCore: see zrnmetrocore.h. A plain Wayland client underneath
- * (wl_shm, cairo, pango, touch; no toolkit).
+ * (Wayland EGL/GLES, cached Cairo/Pango pages, touch; no toolkit).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -24,6 +24,8 @@
 #include "xdg-shell-client-protocol.h"
 #include "viewporter-client-protocol.h"
 #include "zrnmetrocore.h"
+#include "zrnmetrogpu.h"
+#include "zrnmetrorender.h"
 
 #define MARGIN		ZMC_MARGIN
 #define HEADER_H	ZMC_HEADER_H
@@ -43,16 +45,11 @@
 #define ROW_OUT_MS	110	/* one row turning away */
 #define ROW_IN_MS	180	/* one row arriving (the Lumia's Settings: ~150) */
 #define ROW_STAGGER_MS	33	/* between one row starting and the next (its Settings: 33) */
-/* An app's first page arrives as the Lumia's Settings does (screen capture,
- * 0:76, every row's left edge tracked frame by frame): row after row from the
- * top, ENTER_STAGGER_MS apart, each starting ENTER_TRAVEL points right of its
- * place and turning in as it slides home over ENTER_ROW_MS, what is left of
- * the way going as (1 - t)^4; the title the same over ENTER_TITLE_TRAVEL and
- * ENTER_TITLE_MS. A touch ends it at once. */
+/* An app's first page arrives row by row as on the Lumia's Settings screen.
+ * The row stagger is from that recording; the 3D turn, depth and travel use
+ * the Start tiles' arrival curve in ztmetro.c. A touch ends it at once. */
 #define ENTER_STAGGER_MS	28
 #define ENTER_ROW_MS	190
-#define ENTER_TRAVEL	50.0
-#define ENTER_TITLE_TRAVEL	35.0
 #define ENTER_TITLE_MS	200
 #define ENTER_HOLD_MS	60	/* before a touch may cut it short */
 #define GAP_MS		120	/* black between the two pages */
@@ -64,11 +61,11 @@
 #define TURN_OUT_DEG	80.0
 #define TURN_IN_DEG	80.0
 #define DEPTH_FOV_DEG	34.0	/* the shell's field of view, for the same depth */
-#define ANIM_SCALE	2	/* pixels per point while pages are moving: a quarter of the work */
+#define ANIM_SCALE	(zmg_ready() ? zmc.scale : 2)	/* GLES keeps native resolution */
 #define MAX_SOURCES	6
 
 struct zmc_state zmc = { .scale = 4, .width = 360, .height = 640, .running = true,
-	.accent = 0x0050ef };
+	.accent = 0x0050ef, .entrance_rate = 1.0 };
 
 static struct {
 	int fd;
@@ -94,8 +91,8 @@ static double scroll_max(void);
  * it. The window's own surface then holds the title and black, and is drawn
  * once.
  *
- * Whatever else moves (a page turning, tabs sliding, something pressed, the
- * loading dots) is drawn the plain way, with the second surface put away.
+ * EGL/GLES clients use the same cached-page principle for every motion and
+ * do not create the list subsurface. This path remains for EGL fallback.
  */
 static uint32_t hold_at;	/* when a resting finger becomes a hold; 0: not armed */
 static bool held;		/* the hold was used: the lift is not a tap */
@@ -113,6 +110,12 @@ static struct {
 static unsigned cache_gen = 1;	/* goes up each time the cache is drawn again */
 static unsigned list_gen, root_gen;	/* which drawing the two surfaces show; 0: none */
 static bool list_shown;
+
+static void gpu_surface_rect(cairo_surface_t *src, double sx0, double sy0, double sx1, double sy1,
+		double x0, double y0, double x1, double y1, double alpha) {
+	struct zmg_vertex q[4] = { {x0,y0,0}, {x1,y0,0}, {x0,y1,0}, {x1,y1,0} };
+	zmg_surface(src, src == zmc.cache ? cache_gen : 0, sx0, sy0, sx1, sy1, q, alpha);
+}
 #define LIST_MAX_PX	8192	/* a texture no GPU here refuses */
 static bool scroll_to_end;
 uint32_t zmc_now_ms(void);
@@ -123,7 +126,7 @@ static void slider_set(double x, bool done);
 static void zmc_activate(struct zmc_hit *hit);
 static void pivot_forget(void);
 static void collect_rows(struct zmc_rowset *set, double scroll, double tapped, bool reverse);
-static void begin_animation(bool have_from, bool have_to, int target, double tapped);
+static void begin_animation(bool have_from, bool have_to, int target, double tapped, uint32_t requested_start);
 
 /* The shell plays it, if the user has that kind of touch switched on: one
  * line down its control pipe, never waited for. */
@@ -471,6 +474,9 @@ static struct zmc_buffer *buffer_get(int width, int height) {
 static void frame_done(void *data, struct wl_callback *callback, uint32_t time) {
 	wl_callback_destroy(callback);
 	zmc.frame = NULL;
+	if (zmc.entrance && zmc.anim_active && (int32_t)(zmc.anim_start - now_ms()) > 0) {
+		return;	/* the first black frame is enough until Start has left */
+	}
 	bool coasting = zmc.fling && !zmc.touching;
 	if (coasting) {
 		fling_step();
@@ -555,12 +561,22 @@ static cairo_surface_t *page_snapshot(int page, double scroll, int scale) {
  * each placed and scaled for its own depth: the far end grows when it comes
  * toward the viewer and shrinks when it goes away. Coordinates in points. */
 #define SLICES	16
-static void turned_strip(cairo_t *cr, cairo_surface_t *source, double y0, double y1,
-		double degrees, double alpha) {
+static void turned_strip_motion(cairo_t *cr, cairo_surface_t *source, double y0, double y1,
+		double degrees, double alpha, double dx, double depth) {
 	if (alpha <= 0.01) {
 		return;
 	}
-	if (fabs(degrees) < 0.05) {
+	if (!cr) {
+		double a = degrees * M_PI / 180.0, w = zmc.width;
+		struct zmg_vertex q[4] = {
+			{dx,y0,depth}, {dx+w*cos(a),y0,depth-w*sin(a)},
+			{dx,y1,depth}, {dx+w*cos(a),y1,depth-w*sin(a)}
+		};
+		zmg_surface(source, source == zmc.cache ? cache_gen : 0,
+			0, y0 * ANIM_SCALE, w * ANIM_SCALE, y1 * ANIM_SCALE, q, alpha);
+		return;
+	}
+	if (fabs(degrees) < 0.05 && fabs(dx) < 0.01 && fabs(depth) < 0.01) {
 		cairo_save(cr);
 		cairo_rectangle(cr, 0, y0 * ANIM_SCALE, zmc.width * ANIM_SCALE, (y1 - y0) * ANIM_SCALE);
 		cairo_clip(cr);
@@ -580,8 +596,11 @@ static void turned_strip(cairo_t *cr, cairo_surface_t *source, double y0, double
 	for (int k = 0; k < SLICES; k++) {
 		double x0 = w * k / SLICES, x1 = w * (k + 1) / SLICES, xm = (x0 + x1) / 2;
 		/* where x lands: turned, then seen from d in front of the middle */
-		double s0 = d / (d + x0 * sin(a)), s1 = d / (d + x1 * sin(a)), sm = d / (d + xm * sin(a));
-		double px0 = cx + (x0 * cos(a) - cx) * s0, px1 = cx + (x1 * cos(a) - cx) * s1;
+		double s0 = d / (d - depth + x0 * sin(a));
+		double s1 = d / (d - depth + x1 * sin(a));
+		double sm = d / (d - depth + xm * sin(a));
+		double px0 = cx + (x0 * cos(a) + dx - cx) * s0;
+		double px1 = cx + (x1 * cos(a) + dx - cx) * s1;
 		if (px1 - px0 < 0.05 || sm <= 0) {
 			continue;	/* edge on */
 		}
@@ -597,6 +616,11 @@ static void turned_strip(cairo_t *cr, cairo_surface_t *source, double y0, double
 		cairo_paint_with_alpha(cr, alpha);
 		cairo_restore(cr);
 	}
+}
+
+static void turned_strip(cairo_t *cr, cairo_surface_t *source, double y0, double y1,
+		double degrees, double alpha) {
+	turned_strip_motion(cr, source, y0, y1, degrees, alpha, 0, 0);
 }
 
 static double clamp01(double v) {
@@ -629,14 +653,21 @@ static void draw_turnstile(cairo_t *cr, uint32_t ms) {
 	if (zmc.anim_to_surface && ms >= in_start) {
 		for (int i = 0; i < zmc.in_rows.n; i++) {
 			bool title = zmc.in_rows.rows[i].y0 < 1;
-			double t, e, travel = 0;
+			double t, e;
 			if (zmc.entrance) {
-				double life = title ? ENTER_TITLE_MS : ENTER_ROW_MS;
+				double life = (title ? ENTER_TITLE_MS : ENTER_ROW_MS) * zmc.entrance_rate;
 				t = clamp01(((double)(ms - in_start) -
-					zmc.in_rows.rows[i].order * ENTER_STAGGER_MS) / life);
-				double left = (1 - t) * (1 - t) * (1 - t) * (1 - t);
-				travel = (title ? ENTER_TITLE_TRAVEL : ENTER_TRAVEL) * left;
-				e = 1 - left;
+					zmc.in_rows.rows[i].order * ENTER_STAGGER_MS * zmc.entrance_rate) / life);
+				if (t <= 0) {
+					continue;
+				}
+				/* Same fitted angle, depth, travel and shading as Start's tiles. */
+				double angle, depth, travel, alpha;
+				double eye = (zmc.height / 2.0) / tan(DEPTH_FOV_DEG * M_PI / 360.0);
+				zmr_entrance(t, eye, &angle, &depth, &travel, &alpha);
+				turned_strip_motion(cr, zmc.anim_to_surface, zmc.in_rows.rows[i].y0,
+					zmc.in_rows.rows[i].y1, angle, alpha, travel, depth);
+				continue;
 			} else {
 				t = clamp01(((double)(ms - in_start) -
 					zmc.in_rows.rows[i].order * ROW_STAGGER_MS) / ROW_IN_MS);
@@ -646,11 +677,8 @@ static void draw_turnstile(cairo_t *cr, uint32_t ms) {
 				continue;	/* not set off yet */
 			}
 			double alpha = e > 0.3 ? 1 : e / 0.3;	/* solid for most of the turn */
-			cairo_save(cr);
-			cairo_translate(cr, lround(travel * ANIM_SCALE), 0);
 			turned_strip(cr, zmc.anim_to_surface, zmc.in_rows.rows[i].y0,
-				zmc.in_rows.rows[i].y1, (title && zmc.entrance ? 0 : TURN_IN_DEG) * (1 - e), alpha);
-			cairo_restore(cr);
+				zmc.in_rows.rows[i].y1, TURN_IN_DEG * (1 - e), alpha);
 		}
 	}
 }
@@ -787,6 +815,28 @@ static bool hit_at(double x, double y, struct zmc_hit *out) {
 static void draw_press(cairo_t *cr, int scale) {
 	double p = press_amount();
 	if (p <= 0.001) {
+		return;
+	}
+	if (!cr) {
+		struct zmc_hit *hit = &zmc.pressed;
+		double w = hit->w, h = hit->h, x = hit->x, y = hit->y - zmc.scroll;
+		if (w <= 0 || h <= 0) return;
+		double eye = (zmc.height / 2.0) / tan(DEPTH_FOV_DEG * M_PI / 360.0);
+		double max = ZMC_TILT_DEG * M_PI / 180.0;
+		double ry = (zmc.press_fx - 0.5) * 2 * fmin(max, asin(fmin(1.0, ZMC_TILT_LIFT / (w/2)))) * p;
+		double rx = (zmc.press_fy - 0.5) * 2 * fmin(max, asin(fmin(1.0, ZMC_TILT_LIFT / (h/2)))) * p;
+		struct zmg_vertex q[4];
+		for (int i = 0; i < 4; i++) {
+			double X = ((i & 1) ? 0.5 : -0.5) * w;
+			double Y = ((i & 2) ? 0.5 : -0.5) * h;
+			q[i] = (struct zmg_vertex){ x+w/2+X*cos(ry), y+h/2+Y*cos(rx),
+				-ZMC_PRESS_SINK*eye*p-X*sin(ry)-Y*sin(rx) };
+		}
+		zmg_clip(0, HEADER_H, zmc.width, zmc.height - HEADER_H);
+		zmg_rect(x, y, w, h, 0, 0, 0);
+		zmg_surface(zmc.cache, cache_gen, x*scale, hit->y*scale,
+			(x+w)*scale, (hit->y+h)*scale, q, 1);
+		zmg_clip(0, 0, zmc.width, zmc.height);
 		return;
 	}
 	struct zmc_hit *h = &zmc.pressed;
@@ -939,6 +989,8 @@ static void pivot_prepare(void) {
 			&zmc.piv_other_next_dx);
 	}
 	zmc.piv_ready = true;
+	zmg_prepare(zmc.piv_cur, 0);
+	zmg_prepare(zmc.piv_other, 0);
 }
 
 static bool pivot_wants_prepare(void) {
@@ -953,6 +1005,12 @@ static bool pivot_wants_prepare(void) {
 static void band_x(cairo_t *cr, cairo_surface_t *src, double y0, double y1, double x0, double x1,
 		double dx, double src_dy, double alpha, int scale) {
 	if (y1 <= y0 || x1 <= x0 || alpha <= 0.01) {
+		return;
+	}
+	if (!cr) {
+		double s = (double)cairo_image_surface_get_width(src) / zmc.width;
+		gpu_surface_rect(src, (x0-dx)*s, (y0+src_dy)*s, (x1-dx)*s, (y1+src_dy)*s,
+			x0, y0, x1, y1, alpha);
 		return;
 	}
 	cairo_save(cr);
@@ -993,6 +1051,7 @@ static uint32_t pivot_last, pivot_worst;
 
 /* The slide is over (or cut short): the other tab is the page in front. */
 static void pivot_done(void) {
+	zmg_report(zmc.app->app_id);
 	uint32_t ms = now_ms() - zmc.slide_start;
 	fprintf(stderr, "%s: tab slide, %d frames in %u ms (%.1f ms each, worst %u)\n", zmc.app->app_id,
 		pivot_frames, ms, pivot_frames > 1 ? (double)ms / pivot_frames : 0.0, pivot_worst);
@@ -1083,11 +1142,13 @@ static bool draw_pivot(cairo_t *cr, int scale) {
 	 * screen apart, k counting to the right from this one; the titles the same
 	 * way, each a title's width after the one before. u is how many tabs the
 	 * strip has moved left. */
-	cairo_save(cr);
-	cairo_set_source_rgb(cr, 0, 0, 0);
-	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-	cairo_paint(cr);
-	cairo_restore(cr);
+	if (cr) {
+		cairo_save(cr);
+		cairo_set_source_rgb(cr, 0, 0, 0);
+		cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+		cairo_paint(cr);
+		cairo_restore(cr);
+	}
 	double x = zmc.swipe_dx, u = -x / w;
 	double a = zmc.pivot_next_dx, b = zmc.piv_other_next_dx;
 	long k0 = (long)floor(u);
@@ -1176,6 +1237,67 @@ static int present_list(int scale) {
 	return 1;
 }
 
+/* A GPU frame samples cached page textures. Cairo only runs when the app
+ * changes a page, never to copy, rotate or scale it on each motion frame. */
+static void present_gpu(uint32_t ms) {
+	zmc.dirty = false;
+	zmg_begin(zmc.width, zmc.height, zmc.scale);
+	if (zmc.anim_active) {
+		zmc.anim_frames++;
+		draw_turnstile(NULL, ms);
+	} else if (!zmc.quit_after_anim && (zmc.slide_active || zmc.swiping || zmc.spring) &&
+			draw_pivot(NULL, zmc.scale)) {
+		/* The same spring and title parallax, composed as textured quads. */
+	} else if (!zmc.quit_after_anim) {
+		cache_ensure(zmc.scale);
+		double s = zmc.scale, off = zmc.scroll;
+		double top = HEADER_H + (off < 0 ? -off : 0);
+		double from = HEADER_H + (off > 0 ? off : 0);
+		gpu_surface_rect(zmc.cache, 0, from*s, zmc.width*s, (from+zmc.height-top)*s,
+			0, top, zmc.width, zmc.height, 1);
+		gpu_surface_rect(zmc.cache, 0, 0, zmc.width*s, HEADER_H*s,
+			0, 0, zmc.width, HEADER_H, 1);
+		draw_press(NULL, zmc.scale);
+	}
+	if (zmc.busy && !zmc.anim_active) {
+		uint32_t t = (now_ms() - zmc.busy_since) % 2600;
+		float r = ((zmc.accent >> 16) & 255) / 255.0f;
+		float g = ((zmc.accent >> 8) & 255) / 255.0f, b = (zmc.accent & 255) / 255.0f;
+		for (int i = 0; i < 5; i++) {
+			double p = ((double)t - i * 160) / 1700.0;
+			if (p <= 0 || p >= 1) continue;
+			double u = 2*p-1, x = zmc.width * (0.5 + 0.5 * (0.25*u + 0.75*u*u*u));
+			zmg_rect(x-1.5, 3, 3, 3, r, g, b);
+		}
+	}
+	zmc.frame = wl_surface_frame(zmc.surface);
+	wl_callback_add_listener(zmc.frame, &frame_listener, NULL);
+	if (!zmg_end()) {
+		wl_callback_destroy(zmc.frame);
+		zmc.frame = NULL;
+		zmc.running = false;
+	}
+}
+
+static void gpu_prepare_destination(int target) {
+	int previous = zmc.page;
+	/* An unscrolled outgoing page can keep its texture without a snapshot
+	 * copy. Give the destination a separate image before drawing into it. */
+	if (zmc.anim_from_surface == zmc.cache) {
+		cairo_surface_destroy(zmc.cache);
+		zmc.cache = NULL;
+	}
+	zmc.page = target;
+	zmc.cache_stale = true;
+	cache_ensure(zmc.scale);
+	zmc.anim_to_surface = cairo_surface_reference(zmc.cache);
+	collect_rows(&zmc.in_rows, 0, -1, zmc.anim_back);
+	zmc.page = previous;
+	zmc.anim_cache_ready = true;
+	zmc.anim_target_pending = false;
+	zmg_prepare(zmc.anim_to_surface, cache_gen);
+}
+
 static void present(void) {
 	if (!zmc.configured) return;
 	if (zmc.frame) {
@@ -1200,11 +1322,27 @@ static void present(void) {
 	/* an entrance can be set to start a moment from now: black until then */
 	int32_t since = (int32_t)(now_ms() - zmc.anim_start);
 	uint32_t ms = since > 0 ? (uint32_t)since : 0;
+	if (zmc.anim_target_pending) {
+		uint32_t out = rows_duration(&zmc.out_rows, ROW_OUT_MS);
+		if (ms >= out) {
+			gpu_prepare_destination(zmc.anim_to);
+			ms = now_ms() - zmc.anim_start;
+			/* Expensive page content may exceed the gap. The new page still
+			 * gets its complete entrance, starting with its first row. */
+			if (ms > out + GAP_MS) {
+				zmc.anim_start += ms - (out + GAP_MS);
+				ms = out + GAP_MS;
+			}
+			zmc.anim_total = out + GAP_MS + rows_duration(&zmc.in_rows, ROW_IN_MS);
+		}
+	}
 	if (zmc.anim_active && ms >= zmc.anim_total) {
+		zmg_report(zmc.app->app_id);
 		zmc.anim_active = false;
 		zmc.entrance = false;
 		zmc.page = zmc.anim_to;
-		zmc.cache_stale = true;
+		if (!zmc.anim_cache_ready) zmc.cache_stale = true;
+		zmc.anim_cache_ready = false;
 		/* into the session log: how the page change went */
 		fprintf(stderr, "%s: page change, %d frames in %u ms (%.1f ms each)\n",
 			zmc.app->app_id, zmc.anim_frames, ms, zmc.anim_frames > 1 ? (double)ms / zmc.anim_frames : 0.0);
@@ -1221,9 +1359,14 @@ static void present(void) {
 			zmc.app->arrived(zmc.page);
 		}
 	}
+	if (zmc.frame) return;	/* arrived() may have committed an updated page */
 	/* while pages move they are drawn at half the pixels each way */
 	int scale = zmc.anim_active || ((zmc.slide_active || zmc.swiping || zmc.spring) && zmc.piv_ready) ?
 		ANIM_SCALE : zmc.scale;
+	if (zmg_ready()) {
+		present_gpu(ms);
+		return;
+	}
 	/* a page at rest or scrolling, with nothing pressed: the list's own surface */
 	if (list_surface && !zmc.anim_active && !zmc.quit_after_anim && !zmc.busy &&
 			!zmc.slide_active && !zmc.swiping && !zmc.spring &&
@@ -1369,49 +1512,76 @@ static void collect_rows(struct rowset *set, double scroll, double tapped, bool 
 
 /* Start a page change. Either page may be missing: none to leave when the app
  * starts, none to arrive when it closes. */
-static void begin_animation(bool have_from, bool have_to, int target, double tapped) {
+static void begin_animation(bool have_from, bool have_to, int target, double tapped, uint32_t requested_start) {
 	zmc.anim_from = zmc.page;
 	zmc.anim_to = target;
 	zmc.anim_from_surface = zmc.anim_to_surface = NULL;
+	zmc.anim_cache_ready = false;
+	zmc.anim_target_pending = false;
 	bool back = zmc.anim_dir < 0;
 	zmc.anim_back = back || zmc.quit_after_anim;
 	zmc.fling = false;
 	if (have_from) {
 		/* the page in front is drawn already: shrunk, not drawn again (its
 		 * hits, which the rows come from, are the drawing's own) */
-		zmc.anim_from_surface = zmc.cache ? cache_snapshot(ANIM_SCALE) :
-			page_snapshot(zmc.page, zmc.scroll, ANIM_SCALE);
+		if (zmg_ready() && zmc.scroll == 0) {
+			cache_ensure(zmc.scale);
+			zmc.anim_from_surface = cairo_surface_reference(zmc.cache);
+		} else {
+			zmc.anim_from_surface = zmc.cache ? cache_snapshot(ANIM_SCALE) :
+				page_snapshot(zmc.page, zmc.scroll, ANIM_SCALE);
+		}
 		collect_rows(&zmc.out_rows, zmc.scroll, tapped, back);
 	}
 	if (have_to) {
 		zmc.scroll = 0;
-		zmc.anim_to_surface = page_snapshot(target, 0, ANIM_SCALE);
-		collect_rows(&zmc.in_rows, 0, -1, back);
+		if (zmg_ready() && have_from) {
+			zmc.anim_target_pending = true;
+			zmc.in_rows.n = 0;
+		} else if (zmg_ready()) {
+			gpu_prepare_destination(target);
+		} else {
+			zmc.anim_to_surface = page_snapshot(target, 0, ANIM_SCALE);
+			collect_rows(&zmc.in_rows, 0, -1, back);
+		}
 	}
+	zmg_prepare(zmc.anim_from_surface, 0);
+	zmg_prepare(zmc.anim_to_surface, zmc.anim_to_surface == zmc.cache ? cache_gen : 0);
 	zmc.anim_total = (have_from ? rows_duration(&zmc.out_rows, ROW_OUT_MS) : 0) +
 		(have_from && have_to ? GAP_MS : 0) +
 		(have_to ? rows_duration(&zmc.in_rows, ROW_IN_MS) : 0);
+	if (zmc.anim_target_pending) zmc.anim_total += MAX_ROWS * ROW_STAGGER_MS + ROW_IN_MS;
 	if (zmc.entrance && have_to) {
 		int last = 0;
 		for (int i = 0; i < zmc.in_rows.n; i++) {
 			last = zmc.in_rows.rows[i].order > last ? zmc.in_rows.rows[i].order : last;
 		}
-		uint32_t in = (uint32_t)(last * ENTER_STAGGER_MS + ENTER_ROW_MS);
+		uint32_t in = (uint32_t)ceil((last * ENTER_STAGGER_MS + ENTER_ROW_MS) * zmc.entrance_rate);
+		uint32_t title = (uint32_t)ceil(ENTER_TITLE_MS * zmc.entrance_rate);
 		zmc.anim_total = (have_from ? rows_duration(&zmc.out_rows, ROW_OUT_MS) + GAP_MS : 0) +
-			(in > ENTER_TITLE_MS ? in : ENTER_TITLE_MS);
+			(in > title ? in : title);
 	}
 	zmc.anim_frames = 0;
-	zmc.n_hits = 0;	/* nothing can be tapped while the pages turn */
-	zmc.anim_start = now_ms();
+	if (!zmc.anim_cache_ready) zmc.n_hits = 0;	/* touch_down blocks input during the turn */
+	uint32_t now = now_ms();
+	/* Fix the clock before present() can submit the first buffer. Rewinding
+	 * it afterward can expose an advanced title, then a black first frame. */
+	zmc.anim_start = requested_start && (int32_t)(requested_start - now) > 0 &&
+		requested_start - now < 6000 ? requested_start : now;
 	zmc.anim_active = true;
 	zmc.anim_dir = 1;
-	zmc_redraw();
+	if (zmc.anim_cache_ready || zmc.anim_target_pending) {
+		pivot_forget();
+		present();
+	} else {
+		zmc_redraw();
+	}
 }
 
 void zmc_go(int target, int dir) {
 	if (zmc.page == target || zmc.anim_active) return;
 	zmc.anim_dir = dir;
-	begin_animation(true, true, target, dir > 0 ? page_y(zmc.down_y) : -1);
+	begin_animation(true, true, target, dir > 0 ? page_y(zmc.down_y) : -1, 0);
 }
 
 static double scroll_max(void) {
@@ -1748,27 +1918,59 @@ static const struct wl_seat_listener seat_listener = {
 	.name = seat_name,
 };
 
+static bool configure_resized;
+static bool toplevel_active;
+static bool toplevel_ever_active;
+static bool settle_when_configured;
+
 static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface, uint32_t serial) {
 	xdg_surface_ack_configure(xdg_surface, serial);
 	if (!zmc.configured) {
-		/* First time on screen: the hub's rows arrive. The shell says when,
-		 * on the same clock: once Start has left and the black after it is
-		 * over. (An older shell only said when the tile was tapped; it took
-		 * 340 ms to clear Start, then 80 of black.) */
+		/* Snapshot the first page before the shell uncovers the window. The
+		 * shell and client use the same monotonic reveal time. */
 		zmc.configured = true;
-		zmc.entrance = true;
-		begin_animation(false, true, zmc.page, -1);
-		const char *enter = getenv("ZTMETRO_ENTER_MS"), *stamp = getenv("ZTMETRO_LAUNCH_MS");
-		if (enter || stamp) {
-			uint32_t at = enter ? (uint32_t)strtoul(enter, NULL, 10) :
-				(uint32_t)strtoul(stamp, NULL, 10) + 340 + 80;
-			if ((int32_t)(at - now_ms()) > 0 && at - now_ms() < 6000) {
-				zmc.anim_start = at;
-			}
+		configure_resized = false;
+		int speed = 100;
+		const char *speed_env = getenv("ZTMETRO_MENU_SPEED");
+		if (speed_env) {
+			speed = atoi(speed_env);
 		}
+		if (speed < 50 || speed > 200) {
+			speed = 100;
+		}
+		zmc.entrance_rate = 100.0 / speed;
+		const char *slow = getenv("ZTMETRO_SLOW_MOTION");
+		if (slow && atoi(slow) != 0) {
+			zmc.entrance_rate *= 5.0;
+		}
+		zmc.entrance = true;
+		const char *stamp = getenv("ZTMETRO_ENTER_MS");
+		uint32_t at = stamp ? (uint32_t)strtoul(stamp, NULL, 10) : 0;
+		begin_animation(false, true, zmc.page, -1, at);
 		return;
 	}
-	zmc_redraw();
+	if (settle_when_configured) {
+		settle_when_configured = false;
+		/* Hidden surfaces receive no frame callbacks. Commit one complete
+		 * frame now, so returning cannot expose a paused, half-empty page. */
+		if (!zmc.quit_after_anim) {
+			if (zmc.frame) {
+				wl_callback_destroy(zmc.frame);
+				zmc.frame = NULL;
+			}
+			if (zmc.anim_active) {
+				if (zmc.anim_target_pending) gpu_prepare_destination(zmc.anim_to);
+				zmc.anim_start = now_ms() - zmc.anim_total;
+			}
+			if (configure_resized) zmc.cache_stale = true;
+			configure_resized = false;
+			present();
+		}
+	}
+	if (configure_resized) {
+		configure_resized = false;
+		zmc_redraw();
+	}
 }
 
 static const struct xdg_surface_listener xdg_surface_listener = {
@@ -1777,7 +1979,19 @@ static const struct xdg_surface_listener xdg_surface_listener = {
 
 static void xdg_toplevel_configure(void *data, struct xdg_toplevel *xdg_toplevel,
 		int32_t width, int32_t height, struct wl_array *states) {
+	bool active = false;
+	uint32_t *state;
+	wl_array_for_each(state, states) {
+		if (*state == XDG_TOPLEVEL_STATE_ACTIVATED) active = true;
+	}
+	/* Activation must commit a fresh complete buffer as well: the shell
+	 * waits for this configure's buffer before revealing resumed Settings. */
+	if (zmc.configured && ((active && toplevel_ever_active) || (toplevel_active && !active)))
+		settle_when_configured = true;
+	if (active) toplevel_ever_active = true;
+	toplevel_active = active;
 	if (width > 0 && height > 0) {
+		configure_resized |= zmc.width != width || zmc.height != height;
 		zmc.width = width;
 		zmc.height = height;
 	}
@@ -1862,7 +2076,11 @@ static void zmc_activate(struct zmc_hit *hit) {
 	if (zmc.app->activate) {
 		zmc.app->activate(hit->action, hit->arg);
 	}
-	zmc_redraw();
+	if (zmc.anim_active && (zmc.anim_cache_ready || zmc.anim_target_pending)) {
+		present();	/* zmc_go() already prepared the destination */
+	} else {
+		zmc_redraw();
+	}
 }
 
 void zmc_quit(void) {
@@ -1872,7 +2090,7 @@ void zmc_quit(void) {
 	}
 	/* closing: the page's rows leave first */
 	zmc.quit_after_anim = true;
-	begin_animation(true, false, zmc.page, -1);
+	begin_animation(true, false, zmc.page, -1, 0);
 }
 
 void zmc_back(void) {
@@ -2298,7 +2516,8 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 	xdg_toplevel_add_listener(zmc.toplevel, &xdg_toplevel_listener, NULL);
 	xdg_toplevel_set_title(zmc.toplevel, app->title);
 	xdg_toplevel_set_app_id(zmc.toplevel, app->app_id);
-	if (subcompositor && viewporter) {
+	zmg_init(zmc.display, zmc.surface, zmc.width, zmc.height, zmc.scale);
+	if (!zmg_ready() && subcompositor && viewporter) {
 		/* the list's own surface, over the window, taking no touches itself
 		 * (they all go to the window, in its coordinates) */
 		list_surface = wl_compositor_create_surface(zmc.compositor);
@@ -2338,6 +2557,14 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 		}
 		/* a finger resting on something: a hold, when it has rested long enough */
 		int wait = pivot_wants_prepare() ? 150 : -1;
+		if (zmc.entrance && zmc.anim_active && !zmc.frame) {
+			int32_t left = (int32_t)(zmc.anim_start - now_ms());
+			if (left > 0 && (wait < 0 || left < wait)) {
+				wait = left;
+			} else if (left <= 0) {
+				wait = 0;
+			}
+		}
 		if (hold_at) {
 			int32_t left = (int32_t)(hold_at - now_ms());
 			if (left <= 0) {
@@ -2355,6 +2582,12 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 		}
 		/* idle for a moment with a pivot in front: draw both tabs ahead */
 		int ready = poll(fds, n, wait);
+		if (ready == 0 && zmc.entrance && zmc.anim_active && !zmc.frame &&
+				(int32_t)(now_ms() - zmc.anim_start) >= 0) {
+			wl_display_cancel_read(zmc.display);
+			present();
+			continue;
+		}
 		if (ready == 0 && hold_at) {
 			wl_display_cancel_read(zmc.display);
 			continue;	/* the hold's time is up: round again */
@@ -2395,6 +2628,7 @@ int zmc_run(const struct zmc_app *app, int first_page) {
 			}
 		}
 	}
+	zmg_fini();
 	wl_display_disconnect(zmc.display);
 	return 0;
 }

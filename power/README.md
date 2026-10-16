@@ -1,12 +1,18 @@
 # Power on the Galaxy S9 under mainline
 
+**2026-10-15 update:** see [FIRMWARE-AUDIT.md](FIRMWARE-AUDIT.md) for the
+firmware ZIP audit, deployed kernel and timed wake evidence, and current
+deep-sleep blockers. Measurements and implementation status below describe
+earlier experiments unless the audit updates them.
+
 ## Idle drain: why it is high
 
-`/sys/devices/system/cpu/cpuidle/current_driver` is `none`: the cores never
-power down when idle, they only wait in WFI (powered, clocked, caches on).
-User space is idle (97 % idle CPU, Wi-Fi power save on). Suspend to RAM is not
-offered (`mem_sleep` has only `s2idle`): the firmware has no PSCI
-SYSTEM_SUSPEND, Samsung sleeps the system through its own ACPM path.
+The deployed kernel registers `zrn_idle_little` and `zrn_idle_big`; per-core
+C2 and non-boot-cluster CPD return correctly. A 20-second s2idle trial woke
+from the independent MCT alarm with the sensor hub ready. Samsung SICD still
+aborts immediately, and its firmware counters have not yet shown SoC or MIF
+sequencer activity. The phone offers `s2idle` only; successful screen-off
+idle is not yet evidence of complete-system deep sleep.
 
 `drainlog.sh SECONDS [STEP]` logs the fuel gauge to `/var/tmp/drain.log`
 (time, %, mV, current now/avg in mA, cable, screen). A baseline needs the

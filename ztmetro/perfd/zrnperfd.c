@@ -98,14 +98,43 @@ static const int clusters[] = { 0, 4 };
 
 static enum profile profile = BALANCED;
 static bool deepsleep = true, screen_on = true;
-/* The Wi-Fi radio and the modem are never switched off with the screen: a phone that
- * stops receiving while it sleeps is not a phone. The Wi-Fi chip's own power save
- * (listening only for beacons) is on all the time, and ztOSCoreNetworking lowers its
- * polling with the screen. */
+/* The Wi-Fi radio itself goes off five minutes after the screen, on battery:
+ * the chip's own power save (listening only for beacons) is on all the time,
+ * this is the radio entirely, and it is worth about 70 mA when nothing asks
+ * for the network (measured, power/README.md). The screen or a charger brings
+ * it back. The modem is never switched off: a phone that stops receiving
+ * while it sleeps is not a phone. */
 /* tickle mode on battery, plugged in, and in power saver */
 static enum tickle_mode tickle_when[3] = { TICKLE_MODERATE, TICKLE_NOMINAL, TICKLE_HIGH };
 static const char *const conditions[3] = { "battery", "charging", "saver" };
 static bool plugged;
+
+/* the Wi-Fi radio asleep, and when it may go to sleep (0: the timer is off) */
+static bool wifi_asleep;
+static long wifi_sleep_at;
+#define WIFI_SLEEP_MS	300000
+
+static void wifi_radio(bool on) {
+	if (!on) {
+		/* Only restore a radio that this daemon actually switched off. */
+		char state[32];
+		FILE *f = popen("nmcli -t -f WIFI general", "r");
+		bool got = f && fgets(state, sizeof(state), f);
+		int result = f ? pclose(f) : -1;
+		if (!got || result != 0) {
+			return;
+		}
+		if (strncmp(state, "enabled", 7) != 0) {
+			wifi_sleep_at = 0;
+			return;
+		}
+	}
+	if (system(on ? "nmcli radio wifi on" : "nmcli radio wifi off") != 0) {
+		fprintf(stderr, "zrnperfd: the Wi-Fi radio did not go %s\n", on ? "on" : "off");
+		return;
+	}
+	wifi_asleep = !on;
+}
 
 /* a cable in: any power supply other than the battery says it is online */
 static bool read_plugged(void) {
@@ -510,6 +539,7 @@ static void status(void) {
 		fprintf(f, "profile=%s\ndeepsleep=%s\nscreen=%s\n", names[profile],
 			deepsleep ? "on" : "off", screen_on ? "on" : "off");
 		fprintf(f, "condition=%s\nboost=%s\n", conditions[condition()], boost_names[boost]);
+		fprintf(f, "wifi=%s\n", wifi_asleep ? "sleeping" : "on");
 		for (int c = 0; c < 3; c++) {
 			fprintf(f, "tickle_%s=%s\n", conditions[c], tickle_names[tickle_when[c]]);
 		}
@@ -593,6 +623,15 @@ static int command(char *line, bool persist) {
 		screen_on = strcmp(value, "off") != 0;
 		persist = false;
 		tickle_screen(screen_on);
+		if (screen_on) {
+			/* the screen takes the radio back at once; the timer stops */
+			wifi_sleep_at = 0;
+			if (wifi_asleep) {
+				wifi_radio(true);
+			}
+		} else {
+			wifi_sleep_at = plugged ? 0 : boost_ms();
+		}
 		/* the modem daemon asks for the signal less often, */
 		int mfd = open("/run/ztoscorenetworking.ctl", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 		if (mfd >= 0) {
@@ -644,8 +683,26 @@ int main(void) {
 	if (f) {
 		fclose(f);
 	}
+	/* A service restart must retain the compositor's last screen state. */
+	f = fopen(STATUS, "r");
+	while (f && fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "screen=", 7) == 0) {
+			screen_on = strncmp(line + 7, "off", 3) != 0;
+		} else if (strncmp(line, "wifi=", 5) == 0) {
+			wifi_asleep = strncmp(line + 5, "sleeping", 8) == 0;
+		}
+	}
+	if (f) {
+		fclose(f);
+	}
 	plugged = read_plugged();
 	tickle_init();
+	tickle_screen(screen_on);
+	if (wifi_asleep && (screen_on || plugged)) {
+		wifi_radio(true);
+	} else if (!screen_on && !plugged && !wifi_asleep) {
+		wifi_sleep_at = boost_ms();
+	}
 	apply();
 	status();
 
@@ -673,6 +730,16 @@ int main(void) {
 		if (boost_live() && (wait < 0 || wait > BOOST_SAMPLE_MS)) {
 			wait = BOOST_SAMPLE_MS;
 		}
+		/* A screen-off loop may otherwise poll forever with no events. */
+		if (wifi_sleep_at && !wifi_asleep && !screen_on && !plugged) {
+			long left = WIFI_SLEEP_MS - (boost_ms() - wifi_sleep_at);
+			if (left < 1) {
+				left = 1000; /* bound retries if NetworkManager rejects a change */
+			}
+			if (wait < 0 || wait > left) {
+				wait = (int)left;
+			}
+		}
 		if (led_next) {
 			/* the light's next change: every 100 ms, every 50 in the extreme phase */
 			long now = boost_ms();
@@ -696,6 +763,12 @@ int main(void) {
 			if (boost_sample()) {
 				changed = 2;
 			}
+		}
+		/* the radio's time is up: screen off and on battery for five minutes */
+		if (wifi_sleep_at && !wifi_asleep && !screen_on && !plugged &&
+				boost_ms() - wifi_sleep_at >= WIFI_SLEEP_MS) {
+			wifi_radio(false);
+			changed = 1;
 		}
 		if (fds[0].revents & POLLIN) {
 			ssize_t got = read(ctl, pending + pending_len, sizeof(pending) - 1 - pending_len);
@@ -726,6 +799,17 @@ int main(void) {
 						changed = 1;
 					}
 					plugged = now;
+					if (plugged) {
+						/* a charger takes the radio back at once */
+						wifi_sleep_at = 0;
+						if (wifi_asleep) {
+							wifi_radio(true);
+							changed = 1;
+						}
+					} else if (!screen_on && !wifi_asleep && !wifi_sleep_at) {
+						/* the cable came out with the screen off: start now */
+						wifi_sleep_at = boost_ms();
+					}
 				}
 			}
 		}
@@ -742,6 +826,9 @@ int main(void) {
 	}
 	tickle_stop();
 	led_white(false);
+	if (wifi_asleep) {
+		wifi_radio(true);	/* nothing is left switched off behind us */
+	}
 	big_cores(true);	/* nothing is left switched off behind us */
 	cores_allowed("0-7");
 	fprintf(stderr, "zrnperfd: stopped, every app running\n");

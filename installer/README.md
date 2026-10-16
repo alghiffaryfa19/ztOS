@@ -1,5 +1,8 @@
 # Installing ztOS
 
+This guide installs **ztOS ALPHA-2**. The release version is recorded in the
+repository's `VERSION` file.
+
 ztOS is a phone operating system: the ztMETRO shell on Arch Linux ARM, with
 its own apps, an updater and the ztOS SDK. `ztos` builds it and installs it,
 either into an emulator on your computer or onto a Samsung Galaxy S9.
@@ -74,6 +77,8 @@ installer/ztos install --target starlte
 3. **Start TWRP:** power off, then hold Volume Up + Bixby + Power. Plug the
    phone into the computer (`adb devices` shows it as `recovery`).
 4. **Run the installer.** It builds ztOS's boot image and system, then:
+   - builds the Galaxy S9 boot image with WLAN enabled; the build applies the
+     Exynos9810 PCIe and pinctrl resume fixes automatically
    - asks before writing the boot image to BOOT, and reads it back to check it
    - asks you to **type `ERASE`** before writing the system to USERDATA, in
      256 MiB pieces that are each checked (if the cable comes out, run it
@@ -84,6 +89,11 @@ installer/ztos install --target starlte
 
 If the phone ever fails to start, it falls back to TWRP by itself. Run the
 installer again from step 3.
+
+The Wi-Fi resume support is part of the phone kernel/device tree, not a
+separate package. A fresh install that rebuilds the boot image includes it.
+Choosing to reuse a previously built `out/ztos-boot.img` reuses that image as
+is; rebuild it from the current source to include later kernel fixes.
 
 ## What you get
 

@@ -87,6 +87,12 @@ if args.decon:
     enable("DECON")
 if args.wlan:
     enable("WLAN")
+    s += '''
+/* PCI restores endpoint configuration in resume_noirq. Restore its GPIO
+ * providers first, including WL_REG_ON and PERST# mux/data registers. */
+&pinctrl_fsys1 { samsung,noirq-resume; };
+&pinctrl_peric0 { samsung,noirq-resume; };
+'''
 
 if not args.power:
     disable("""			interrupt-controller;

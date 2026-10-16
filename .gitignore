@@ -40,3 +40,6 @@ ztmetro/messages/ztmessages
 ztmetro/contacts/ztcontacts
 ztmetro/core/*-protocol.c
 ztmetro/core/*-client-protocol.h
+
+# SDK native renderer artifacts, rebuilt for each target
+sdk/native/prebuilt/

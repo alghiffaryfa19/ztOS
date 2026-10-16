@@ -18,6 +18,9 @@ it from $ZTOS_PASSWORD; `doctor --fix` takes root's from $ZTOS_ROOT_PASSWORD.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import platform
 import fnmatch
 import io
 import json
@@ -152,6 +155,7 @@ def app_env(project: Project) -> dict:
 
 def cmd_run(args):
     project = find_project(args.project)
+    native_library("host")
     env = app_env(project)
     if args.shot:
         env["ZTOS_SHOT"] = str(Path(args.shot).resolve())
@@ -284,9 +288,49 @@ def pyc(source: bytes, name: str) -> bytes:
     return bytes(_code_to_hash_pyc(code, importlib.util.source_hash(source), checked=False))
 
 
+def native_library(target: str, device=None) -> Path:
+    """Build/cache the C backend for the actual target, including phone builds.
+
+    Apps carry their own library; the warm runtime gets the same bytes.
+    Source hashes prevent deploying a stale ABI after a renderer change.
+    """
+    arch = platform.machine() if target == "host" else target
+    native = SDK / "native"
+    shared = SDK.parent / "ztmetro/core/zrnmetrorender.h"
+    digest = hashlib.sha256((native / "renderer.c").read_bytes() + shared.read_bytes()).hexdigest()
+    out = native / "prebuilt" / arch / "libztos-render.so"
+    stamp = out.with_suffix(".sha256")
+    if out.is_file() and stamp.is_file() and stamp.read_text().strip() == digest:
+        return out
+    if arch == platform.machine():
+        result = subprocess.run(["make", "-B", "-C", str(native), f"ARCH={arch}"], capture_output=True)
+        if result.returncode:
+            raise Fail("cannot build native renderer (install a C compiler and GLES2 development files):\n" + result.stderr.decode())
+    elif device is not None:
+        say("building the C GLES renderer on the phone")
+        bundle = io.BytesIO()
+        with tarfile.open(fileobj=bundle, mode="w") as tar:
+            tar.add(native / "renderer.c", "renderer.c")
+            tar.add(shared, "zrnmetrorender.h")
+        encoded = device.run(
+            "set -e; t=$(mktemp -d); trap 'rm -rf \"$t\"' EXIT; tar xf - -C \"$t\"; "
+            f"test \"$(uname -m)\" = {shlex.quote(arch)}; "
+            "cd \"$t\"; cc -std=c11 -O2 -Wall -Wextra -Werror -fPIC -shared -I. "
+            "$(pkg-config --cflags glesv2) -o renderer.so renderer.c $(pkg-config --libs glesv2) -lm; "
+            "base64 -w0 renderer.so", data=bundle.getvalue())
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(base64.b64decode(encoded, validate=True))
+    else:
+        raise Fail(f"no current C renderer for {arch}; use deploy to build it on the phone, "
+                   f"or cross-compile with make -C {native} ARCH={arch} CC=YOUR_CC")
+    stamp.write_text(digest + "\n")
+    return out
+
+
 def build(project: Project, target: str = "aarch64", python: str | None = None) -> Path:
     """`python` is the phone's Python (major.minor): when it is this one's, the
     code goes in compiled too, and the app starts without compiling it."""
+    native = native_library(target)
     compiled = python == "%d.%d" % sys.version_info[:2]
     launcher = LAUNCHERS / f"ztos-launch-{'x86_64' if target == 'host' else target}"
     if not launcher.is_file():
@@ -318,6 +362,7 @@ def build(project: Project, target: str = "aarch64", python: str | None = None) 
                     if compiled and name.endswith(".py"):
                         z.writestr(name + "c", pyc(data, name))
                 put(BOOTSTRAP.encode(), "__main__.py")
+                put(native.read_bytes(), "lib/ztos/_native_renderer.so")
                 z.writestr("ztos.json", json.dumps(project.manifest, indent=1))
                 for rel in files:
                     put((project.root / rel).read_bytes(), f"app/{rel.as_posix()}")
@@ -415,6 +460,7 @@ def install(project: Project, device: Device, binary: Path):
     with tarfile.open(fileobj=bundle, mode="w") as tar:
         tar.add(binary, "app")
         tar.add(icon_src if icon_src.is_file() else TEMPLATE / "icon.svg", "icon")
+        tar.add(native_library("aarch64"), "lib/ztos/_native_renderer.so")
         tar.add(RUNTIME / "zygote.py", "zygote.py")    # the warm runtime apps start from
         for path in sorted((RUNTIME / "ztos").glob("*.py")):
             tar.add(path, f"lib/ztos/{path.name}")     # what it preloads
@@ -434,9 +480,9 @@ def install(project: Project, device: Device, binary: Path):
         "zy=zygote; z=$HOME/.local/share/ztos/$zy.py; "
         "l=$HOME/.local/share/ztos/lib/ztos; new=0; "
         "cmp -s \"$t/$zy.py\" \"$z\" || new=1; "
-        "for f in \"$t\"/lib/ztos/*.py; do cmp -s \"$f\" \"$l/$(basename \"$f\")\" || new=1; done; "
+        "for f in \"$t\"/lib/ztos/*; do cmp -s \"$f\" \"$l/$(basename \"$f\")\" || new=1; done; "
         "if [ $new = 1 ]; then install -Dm644 \"$t/$zy.py\" \"$z\"; mkdir -p \"$l\"; rm -rf \"$l\"/*; "
-        "cp \"$t\"/lib/ztos/*.py \"$l/\"; python3 -m compileall -q \"$l\" >/dev/null 2>&1; "
+        "cp \"$t\"/lib/ztos/* \"$l/\"; python3 -m compileall -q \"$l\" >/dev/null 2>&1; "
         "pkill -f 'share/ztos/[z]ygote.py' || true; sleep 0.3; fi; "
         # warm now, so the next app starts from it
         "if ! pgrep -f 'share/ztos/[z]ygote.py' >/dev/null; then mkdir -p $HOME/.local/state/ztos; "
@@ -451,6 +497,7 @@ def cmd_install(args):
     project = find_project(args.project)
     device = device_of(args, project)
     found = ensure_ready(device, project)
+    native_library("aarch64", device)
     binary = build(project, python=".".join(found.get("python", "").split(".")[:2]))
     say(f"installing {project.name} {project.version} on {device.spec}")
     install(project, device, binary)
@@ -498,7 +545,7 @@ def cmd_logs(args):
     project = find_project(args.project)
     device = device_of(args, project)
     log = f"{LOG_DIR}/{project.id}.log"
-    if args.follow:
+    if getattr(args, "follow", False):
         device.run(f"tail -n 50 -F $HOME/{log}", check=False, capture=False)
     else:
         print(device.run(f"cat $HOME/{log} 2>/dev/null || echo '(no log yet: the app has not run)'"), end="")
