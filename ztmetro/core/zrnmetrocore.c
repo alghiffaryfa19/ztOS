@@ -918,7 +918,7 @@ static void draw_press(cairo_t *cr, int scale) {
 #define PIVOT_LIGHT	60.0	/* and over which its title lights up */
 #define PIVOT_FLICK	0.3	/* or this fast, points per ms */
 #define PIVOT_SPRING_W	0.018	/* per ms: in place in about a quarter second */
-#define CAPS_H		26	/* the app's name: it does not move */
+#define CAPS_H		32	/* includes Segoe UI caps descenders; stays fixed during pivots */
 
 /* A page drawn whole with nothing behind it (so that two can lie over each
  * other), at `scale`, scrolled by `scroll`; its rows into `rows`. What the

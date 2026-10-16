@@ -55,10 +55,12 @@ enum page {
 	PAGE_APN,
 	PAGE_WIFI_JOIN,	/* a network's password, the first time */
 	PAGE_WIFI_NET,	/* one network: its state, its address, forgetting it */
+	PAGE_DATE,
 };
 
 enum action {
-	ACT_NONE,
+	ACT_DATE_AUTO = 500, ACT_DATE_FIELD, ACT_DATE_REGION, ACT_DATE_SAVE, ACT_DATE_SYNC,
+	ACT_NONE = 0,
 	ACT_OPEN_PAGE,
 	ACT_BACK,
 	ACT_ACCENT,
@@ -822,6 +824,8 @@ static double draw_main(cairo_t *cr) {
 	snprintf(detail, sizeof(detail), "Mali-G72 MP18 (%s), 60 FPS", app.gpu_gov);
 	y = zmc_entry(cr, y, "graphics", detail, ACT_OPEN_PAGE, PAGE_GPU);
 
+	y = zmc_entry(cr, y, "date + region", "date, time zone and regional formats", ACT_OPEN_PAGE, PAGE_DATE);
+
 	y = zmc_entry(cr, y, "about", "Samsung Galaxy S9, ztOS Mobile", ACT_OPEN_PAGE, PAGE_ABOUT);
 
 	return y + 20;
@@ -1158,7 +1162,118 @@ static double draw_apn(cairo_t *cr) {
 static void wifi_join(void);
 static void wifi_net_set(const char *ssid);
 
+/* Date and region jobs run off the drawing thread. */
+static const char *const DATE_REGIONS[] = { "United States", "United Kingdom",
+    "Sri Lanka (Sinhala)", "Sri Lanka (Tamil)", "India (English)", "Germany",
+    "France", "Japan", "Australia", "China", "International" };
+static const char *const DATE_LOCALES[] = { "en_US.UTF-8", "en_GB.UTF-8",
+    "si_LK.UTF-8", "ta_LK.UTF-8", "en_IN.UTF-8", "de_DE.UTF-8",
+    "fr_FR.UTF-8", "ja_JP.UTF-8", "en_AU.UTF-8", "zh_CN.UTF-8", "C.UTF-8" };
+static char date_fields[4][256]; /* date, time, IANA zone, NTP servers */
+static bool date_synced;
+static char date_region[96] = "C.UTF-8", date_note[384];
+static int date_focus = -1, date_selected = 10;
+static bool date_auto = true;
+static FILE *date_pipe;
+static char date_result[4096];
+static size_t date_result_len;
+
+static void date_ready(int fd, void *data) {
+    ssize_t n = read(fd, date_result + date_result_len, sizeof(date_result)-1-date_result_len);
+    if (n > 0) {
+        date_result_len += n;
+        if (date_result_len < sizeof(date_result)-1) return;
+    } else if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
+    zmc_watch_fd(fd, NULL, NULL);
+    int result = pclose(date_pipe); date_pipe = NULL;
+    date_result[date_result_len] = 0;
+    char *save;
+    for (char *line = strtok_r(date_result, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq++ = 0;
+        if (!strcmp(line, "Timezone")) snprintf(date_fields[2], sizeof(date_fields[2]), "%s", eq);
+        else if (!strcmp(line, "Date")) snprintf(date_fields[0], sizeof(date_fields[0]), "%s", eq);
+        else if (!strcmp(line, "Time")) snprintf(date_fields[1], sizeof(date_fields[1]), "%s", eq);
+        else if (!strcmp(line, "NTP")) date_auto = !strcmp(eq, "yes");
+        else if (!strcmp(line, "NTPSynchronized")) date_synced = !strcmp(eq, "yes");
+        else if (!strcmp(line, "Servers")) snprintf(date_fields[3], sizeof(date_fields[3]), "%s", eq);
+        else if (!strcmp(line, "Region")) {
+            snprintf(date_region, sizeof(date_region), "%s", eq);
+            date_selected = -1;
+            for (int i=0; i<11; i++) if (!strcmp(eq, DATE_LOCALES[i])) date_selected = i;
+        } else if (!strcmp(line, "Note")) snprintf(date_note, sizeof(date_note), "%s", eq);
+    }
+    if (result && !date_note[0]) snprintf(date_note, sizeof(date_note), "Could not update date and region. Try again.");
+    if (!result) {
+        const char *runtime = getenv("XDG_RUNTIME_DIR");
+        char path[300];
+        if (runtime) {
+            snprintf(path, sizeof(path), "%s/ztmetro.ctl", runtime);
+            pipe_tell(path, "clock\n");
+        }
+    }
+    zmc_redraw();
+}
+
+static void date_job(int operation) {
+    if (date_pipe) return;
+    char command[8192];
+    if (operation) {
+        char zone[1600], region[600], date[1600], clock[1600], servers[1600];
+        shell_quote(zone, sizeof(zone), date_fields[2]);
+        shell_quote(region, sizeof(region), date_region);
+        shell_quote(date, sizeof(date), date_fields[0]);
+        shell_quote(clock, sizeof(clock), date_fields[1]);
+        shell_quote(servers, sizeof(servers), date_fields[3]);
+        if (operation == 2)
+            snprintf(command, sizeof(command), "ztos-auth /usr/local/libexec/ztos-date-region sync %s 2>&1", servers);
+        else
+            snprintf(command, sizeof(command), "ztos-auth /usr/local/libexec/ztos-date-region apply %s %s %s %s %s %s 2>&1",
+                zone, region, date_auto ? "yes" : "no", date, clock, servers);
+        snprintf(date_note, sizeof(date_note), "Saving...");
+    } else {
+        snprintf(command, sizeof(command), "/usr/local/libexec/ztos-date-region status 2>&1");
+        date_note[0] = 0;
+    }
+    date_result_len = 0;
+    date_pipe = popen(command, "r");
+    if (!date_pipe) { snprintf(date_note, sizeof(date_note), "Unable to open date settings."); return; }
+    int fd = fileno(date_pipe);
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    zmc_watch_fd(fd, date_ready, NULL);
+}
+
+static double draw_date(cairo_t *cr) {
+    double y = zmc_header(cr, "date + region");
+    y = zmc_switch(cr, y, "Set time automatically", date_auto, ACT_DATE_AUTO);
+    if (!date_auto) {
+        y = zmc_textbox(cr, y, "Date (YYYY-MM-DD)", date_fields[0], date_focus == 0, ACT_DATE_FIELD, 0);
+        y = zmc_textbox(cr, y, "Time (HH:MM)", date_fields[1], date_focus == 1, ACT_DATE_FIELD, 1);
+    }
+    y = zmc_textbox(cr, y, "Time zone", date_fields[2], date_focus == 2, ACT_DATE_FIELD, 2);
+    cairo_set_source_rgb(cr, .6, .6, .6);
+    y += zmc_text(cr, "For example: Asia/Colombo, Europe/London, or America/New_York.", FONT_REGULAR, 13, MARGIN, y, zmc.width-2*MARGIN)+12;
+    y = picker(cr, y, "Regional formats", DATE_REGIONS, 11, date_selected, ACT_DATE_REGION);
+    y = zmc_textbox(cr, y, "NTP servers", date_fields[3], date_focus == 3, ACT_DATE_FIELD, 3);
+    y = zmc_entry(cr, y, "sync now", date_synced ? "Time synchronized" : "Request time from your NTP server",
+        ACT_DATE_SYNC, 0);
+    y = zmc_entry(cr, y, date_pipe ? "please wait" : "save",
+        date_note[0] ? date_note : "Apply date, time zone and regional formats", ACT_DATE_SAVE, 0);
+    return y+20;
+}
+
 static void typed(const char *text) {
+    if (zmc.page == PAGE_DATE && date_focus >= 0 && !date_pipe) {
+        char *field = date_fields[date_focus]; size_t len = strlen(field);
+        if (text[0] == '\b') { if (len) field[len-1] = 0; }
+        else if (text[0] == '\n') { date_focus = -1; zmc_keyboard(false); }
+        else if (text[0] >= ' ' && text[0] < 127 && len+1 < sizeof(date_fields[0])) {
+            field[len] = text[0]; field[len+1] = 0;
+        }
+        date_note[0] = 0;
+        return;
+    }
 	if (zmc.page == PAGE_WIFI_JOIN && wifi_typing) {
 		size_t len = strlen(wifi_password);
 		if (text[0] == '\b') {
@@ -1583,6 +1698,7 @@ static double draw_dev(cairo_t *cr) {
 
 static double render_page_content(cairo_t *cr, int p) {
 	switch (p) {
+	case PAGE_DATE: return draw_date(cr);
 	case PAGE_PERF: return draw_perf(cr);
 	case PAGE_DEV: return draw_dev(cr);
 	case PAGE_MAIN: return draw_main(cr);
@@ -1612,7 +1728,7 @@ static bool is_picker(int action) {
 	case ACT_TIMEOUT_CYCLE: case ACT_SCALE_CYCLE: case ACT_NAV_SIZE_CYCLE:
 	case ACT_NETWORK_MODE: case ACT_COMP_ALGO_CYCLE: case ACT_PERF_PROFILE:
 	case ACT_TICKLE_BATTERY: case ACT_TICKLE_CHARGING: case ACT_TICKLE_SAVER:
-	case ACT_DEV_MENU_SPEED: case ACT_APN_AUTH:
+	case ACT_DEV_MENU_SPEED: case ACT_APN_AUTH: case ACT_DATE_REGION:
 		return true;
 	}
 	return action >= ACT_QUICK_SLOT && action <= ACT_QUICK_LAST;
@@ -1657,6 +1773,26 @@ static void activate(int action, int arg) {
 		zmc_haptic(pulses[arg & 3]);
 		break;
 	}
+    case ACT_DATE_AUTO:
+        if (!date_pipe) { date_auto = !date_auto; date_focus = -1; zmc_keyboard(false); }
+        break;
+    case ACT_DATE_FIELD:
+        if (!date_pipe && arg >= 0 && arg < 4) { date_focus = arg; zmc_keyboard(true); }
+        break;
+    case ACT_DATE_REGION:
+        if (!date_pipe && arg >= 0 && arg < 11) {
+            date_selected = arg;
+            snprintf(date_region, sizeof(date_region), "%s", DATE_LOCALES[arg]);
+            static const char *const pools[] = { "us", "uk", "lk", "lk", "in", "de", "fr", "jp", "au", "cn", "" };
+            snprintf(date_fields[3], sizeof(date_fields[3]), "%s%spool.ntp.org", pools[arg], pools[arg][0] ? "." : "");
+        }
+        break;
+    case ACT_DATE_SYNC:
+        date_focus = -1; zmc_keyboard(false); date_job(2);
+        break;
+    case ACT_DATE_SAVE:
+        date_focus = -1; zmc_keyboard(false); date_job(true);
+        break;
 	case ACT_OPEN_PAGE:
 		if (arg == PAGE_MAIN || arg == PAGE_APPS) {
 			hub_tab = arg;	/* where back returns to from a page under it */
@@ -1922,7 +2058,7 @@ static void activate(int action, int arg) {
 		{
 			char cmd[256];
 			snprintf(cmd, sizeof(cmd),
-				"sudo sh -c 'echo %s > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor && echo %s > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor' 2>/dev/null &",
+				"ztos-auth sh -c 'echo %s > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor && echo %s > /sys/devices/system/cpu/cpufreq/policy4/scaling_governor' 2>/dev/null &",
 				app.cpu_gov, app.cpu_gov);
 			if (system(cmd) != 0) {}
 		}
@@ -1934,7 +2070,7 @@ static void activate(int action, int arg) {
 		app.swappiness = (app.swappiness >= 100) ? 10 : app.swappiness + 20;
 		{
 			char cmd[128];
-			snprintf(cmd, sizeof(cmd), "sudo sh -c 'echo %d > /proc/sys/vm/swappiness' 2>/dev/null &", app.swappiness);
+			snprintf(cmd, sizeof(cmd), "ztos-auth sh -c 'echo %d > /proc/sys/vm/swappiness' 2>/dev/null &", app.swappiness);
 			if (system(cmd) != 0) {}
 		}
 		break;
@@ -1949,7 +2085,7 @@ static void activate(int action, int arg) {
 		}
 		{
 			char cmd[128];
-			snprintf(cmd, sizeof(cmd), "sudo sh -c 'echo %s > /sys/class/devfreq/17500000.gpu/governor' 2>/dev/null &", app.gpu_gov);
+			snprintf(cmd, sizeof(cmd), "ztos-auth sh -c 'echo %s > /sys/class/devfreq/17500000.gpu/governor' 2>/dev/null &", app.gpu_gov);
 			if (system(cmd) != 0) {}
 		}
 		break;
@@ -2016,7 +2152,7 @@ static void slide(int action, int value, bool done) {
 	case ACT_SWAPPINESS_STEP:
 		app.swappiness = value;
 		if (done) {
-			snprintf(cmd, sizeof(cmd), "sudo sh -c 'echo %d > /proc/sys/vm/swappiness' 2>/dev/null &", value);
+			snprintf(cmd, sizeof(cmd), "ztos-auth sh -c 'echo %d > /proc/sys/vm/swappiness' 2>/dev/null &", value);
 			if (system(cmd) != 0) {}
 		}
 		break;
@@ -2137,6 +2273,7 @@ static bool back(void) {
 		zmc_go(PAGE_WIFI, -1);
 		return true;
 	}
+	if (zmc.page == PAGE_DATE) { date_focus = -1; zmc_keyboard(false); }
 	if (zmc.page == PAGE_APN) {
 		apn_focus = -1;
 		zmc_keyboard(false);
@@ -2148,6 +2285,7 @@ static bool back(void) {
 }
 
 static void arrived(int page) {
+    if (page == PAGE_DATE) { date_focus = -1; date_job(false); }
 	if (page == PAGE_MAIN || page == PAGE_APPS) {
 		hub_tab = page;	/* swiped to: where back returns to from under it */
 	}
@@ -2186,7 +2324,7 @@ static const struct zmc_app settings = {
  * That is how the look is checked without opening the app on the phone. */
 static int render_to_file(const char *name, const char *path) {
 	static const struct { const char *name; enum page page; } pages[] = {
-		{ "main", PAGE_MAIN }, { "apps", PAGE_APPS }, { "theme", PAGE_THEME }, { "display", PAGE_DISPLAY },
+		{ "date", PAGE_DATE }, { "main", PAGE_MAIN }, { "apps", PAGE_APPS }, { "theme", PAGE_THEME }, { "display", PAGE_DISPLAY },
 		{ "wifi", PAGE_WIFI }, { "mobile", PAGE_MOBILE }, { "audio", PAGE_AUDIO },
 		{ "battery", PAGE_BATTERY }, { "cpu", PAGE_CPU }, { "vm", PAGE_VM },
 		{ "gpu", PAGE_GPU }, { "keyboard", PAGE_KEYBOARD }, { "about", PAGE_ABOUT },

@@ -199,7 +199,7 @@
 #define APP_IN_MS	350	/* an app swinging in from behind */
 #define APP_OUT_MS	250	/* and out, backward: away from the viewer */
 #define OSK_MS		200
-#define LAUNCH_WAIT_MS	4000	/* an app that shows nothing by then: Start comes back */
+#define LAUNCH_WAIT_MS	30000	/* allow cold starts and D-Bus activation to map a window */
 
 #define FONT_LIGHT	"Segoe UI Light, Selawik Light, Open Sans Light, sans-serif"
 #define FONT_SEMILIGHT	"Segoe UI Semilight, Selawik Semilight, Open Sans, sans-serif"
@@ -274,6 +274,7 @@ struct zt_toplevel {
 	struct wlr_xdg_toplevel *xdg_toplevel;
 	bool mapped;
 	bool introduced;	/* it has been in front before */
+	char launch_command[256];	/* survives launcher exit / D-Bus handoff */
 	/* an SDK app, first time up: kept out of sight behind "Loading..." until
 	 * it says "ready" (its pages built, its entrance prepared), so that its
 	 * start-up work never shares the processor with an animation on screen */
@@ -347,6 +348,7 @@ enum touch_role {
 	ROLE_LOCK,	/* on the lock screen */
 	ROLE_SWITCH,	/* among the app switcher's cards */
 	ROLE_KEY,	/* on the keyboard */
+	ROLE_CURSOR,	/* holding the keyboard cursor dot */
 	ROLE_SHADE,	/* dragging or interacting with the status bar shade / Action Center */
 	ROLE_MENU,	/* while the app list's menu is open */
 };
@@ -507,6 +509,11 @@ struct zt_server {
 	struct zt_layer volume_layer;
 	struct wl_event_source *volume_timer;
 	/* Lumia Metro top modal dialog */
+    bool auth_active, auth_busy, auth_success, auth_osk_was_visible;
+    int auth_fd;
+    struct wl_event_source *auth_source;
+    char auth_password[512], auth_status[160], auth_read[1024];
+    size_t auth_len, auth_read_len;
 	bool dialog_open;
 	float dialog_y;			/* 0 shown, -dialog_h out of sight */
 	double dialog_h;
@@ -614,6 +621,8 @@ struct zt_server {
 	struct zt_layer menu_layer;
 	/* an app asked for and not yet showing anything: "Loading..." and the dots,
 	 * as the phone's own, once Start has gone (0: none) */
+	char pending_command[256];
+	pid_t pending_pid;
 	uint32_t loading_since;
 	struct zt_layer loading_text, loading_dot;
 
@@ -661,6 +670,8 @@ struct zt_server {
 	struct osk_key keys[MAX_KEYS];
 	int n_keys;
 	int osk_pressed;		/* -1: none */
+	bool osk_trackpad;
+	struct touch_point *osk_cursor_touch;
 	double osk_h;
 	cairo_surface_t *osk_base_surface;
 	bool osk_base_dirty;
@@ -684,6 +695,11 @@ struct zt_server {
 	struct wl_listener new_output, new_input, new_xdg_toplevel, new_xdg_popup,
 		new_decoration, new_text_input, new_surface, request_set_selection;
 };
+
+static void auth_input(struct zt_server *, uint32_t, const char *);
+static void auth_submit(struct zt_server *);
+static void auth_finish(struct zt_server *);
+static void draw_dialog(struct zt_server *);
 
 static uint32_t now_ms(void) {
 	struct timespec ts;
@@ -1158,26 +1174,12 @@ static void set_rgb(cairo_t *cr, uint32_t color);
 static void draw_text(cairo_t *cr, const char *text, const char *font, double size,
 		double x, double y, double box_w, double box_h, bool centre);
 #define LOADING_X	20.0f
-static void draw_loading(struct zt_server *server) {
-	uint32_t now = now_ms();
-	if (server->shown && server->shown->awaiting && now - server->shown->awaiting_since > 4000) {
-		app_ready(server, server->shown);	/* never said: shown anyway */
-	}
-	bool waiting = !server->shown || server->shown->awaiting;
-	if (!server->loading_since || !waiting || server->switch_t > 0.001f || server->locked) {
-		return;
-	}
-	uint32_t since = now - server->loading_since;
-	uint32_t gone = menu_ms(server, (uint32_t)start_out_ms(server) + TURN_GAP_MS) + 150;
-	if (since > LAUNCH_WAIT_MS + 1000 || (since > gone && !server->shown && server->start_t < 0.5f)) {
-		/* given up on, or Start has come back after leaving: no more frames for it */
-		server->loading_since = 0;
-		return;
-	}
-	damage(server);
-	if (since < gone) {
-		return;		/* Start still leaving: nothing yet (a quick app needs none) */
-	}
+static bool loading_active(struct zt_server *server) {
+    return server->loading_since && (!server->shown || server->shown->awaiting) &&
+        server->switch_t <= 0.001f && !server->locked;
+}
+
+static void prepare_loading(struct zt_server *server) {
 	if (!server->loading_text.tex) {
 		cairo_t *cr;
 		struct zt_buffer *buffer = zt_buffer_create(server, 200, 30, &cr);
@@ -1189,6 +1191,29 @@ static void draw_loading(struct zt_server *server) {
 		cairo_paint(cr);
 		zt_buffer_show(server, &server->loading_dot, buffer, cr, 3, 3);
 	}
+}
+
+static void draw_loading(struct zt_server *server) {
+	uint32_t now = now_ms();
+	if (server->shown && server->shown->awaiting && now - server->shown->awaiting_since > 4000) {
+		app_ready(server, server->shown);	/* never said: shown anyway */
+	}
+	bool waiting = !server->shown || server->shown->awaiting;
+	if (!server->loading_since || !waiting || server->switch_t > 0.001f || server->locked) {
+		return;
+	}
+	uint32_t since = now - server->loading_since;
+	uint32_t gone = menu_ms(server, (uint32_t)start_out_ms(server) + TURN_GAP_MS) + 150;
+	if (since > gone && !server->shown && server->start_t < 0.5f) {
+		/* given up on, or Start has come back after leaving: no more frames for it */
+		server->loading_since = 0;
+		return;
+	}
+	if (since < gone) {
+		return;		/* Start still leaving: nothing yet (a quick app needs none) */
+	}
+	prepare_loading(server);
+
 	static uint32_t logged;
 	if (logged != server->loading_since) {
 		logged = server->loading_since;
@@ -3551,6 +3576,7 @@ static int net_tick(void *data) {
 /* Once a minute, on the minute: the only thing that wakes an idle shell. */
 static int clock_tick(void *data) {
 	struct zt_server *server = data;
+    tzset(); /* localtime_r does not refresh a changed /etc/localtime itself */
 	if (server->width > 0) {
 		modem_read(server);
 		draw_status(server);
@@ -4042,6 +4068,41 @@ static void osk_row(struct zt_server *server, const struct osk_key *row, int n,
 	}
 }
 
+/* Shared top-row cell width; shorter letter rows are centered. */
+static void osk_grid_row(struct zt_server *server, const struct osk_key *row,
+        int n, double y) {
+    int start = server->n_keys;
+    osk_row(server, row, n, y, server->key_height, 0);
+    double unit = (server->width - 11 * KEY_GAP) / 10.0;
+    double columns = 0;
+    for (int i = 0; i < n; i++) columns += row[i].weight;
+    double x = KEY_GAP + (10 - columns) * (unit + KEY_GAP) / 2.0;
+    for (int i = start; i < server->n_keys; i++) {
+        struct osk_key *key = &server->keys[i];
+        key->x = x;
+        key->w = unit * key->weight + KEY_GAP * (key->weight - 1);
+        x += key->w + KEY_GAP;
+    }
+    /* Function keys absorb the side margins; letter widths stay uniform. */
+    struct osk_key *first = &server->keys[start];
+    struct osk_key *last = &server->keys[server->n_keys - 1];
+    if (first->action == ACT_SHIFT || first->action == ACT_PAGE) {
+        first->w += first->x - KEY_GAP;
+        first->x = KEY_GAP;
+    }
+    if (last->keycode == KEY_BACKSPACE || last->keycode == KEY_ENTER)
+        last->w = server->width - KEY_GAP - last->x;
+}
+
+static double osk_dot_x(struct zt_server *server) {
+    double pitch = (server->width - KEY_GAP) / 10.0;
+    return 1.5 * pitch + KEY_GAP / 2.0;
+}
+
+static double osk_dot_y(struct zt_server *server) {
+    return server->osk_h - server->key_height - KEY_GAP / 2.0;
+}
+
 #define K(label, code) { label, NULL, code, false, ACT_CHAR, 1 }
 #define KS(label, code) { label, NULL, code, true, ACT_CHAR, 1 }
 #define KBACKSPACE { NULL, "backspace", KEY_BACKSPACE, false, ACT_CHAR, 1.5 }
@@ -4068,9 +4129,10 @@ static void osk_layout(struct zt_server *server) {
 		K("f", KEY_F), K("g", KEY_G), K("h", KEY_H), K("j", KEY_J), K("k", KEY_K),
 		K("l", KEY_L) };
 	static const struct osk_key l3[] = {
-		{ NULL, "shift", 0, false, ACT_SHIFT, 1.5 },
+		{ NULL, "shift", 0, false, ACT_SHIFT, 1 },
 		K("z", KEY_Z), K("x", KEY_X), K("c", KEY_C), K("v", KEY_V), K("b", KEY_B),
-		K("n", KEY_N), K("m", KEY_M), KBACKSPACE };
+		K("n", KEY_N), K("m", KEY_M),
+		{ NULL, "backspace", KEY_BACKSPACE, false, ACT_CHAR, 1 } };
 	static const struct osk_key s1[] = { K("1", KEY_1), K("2", KEY_2), K("3", KEY_3),
 		K("4", KEY_4), K("5", KEY_5), K("6", KEY_6), K("7", KEY_7), K("8", KEY_8),
 		K("9", KEY_9), K("0", KEY_0) };
@@ -4082,15 +4144,15 @@ static void osk_layout(struct zt_server *server) {
 		K("/", KEY_SLASH), KS("?", KEY_SLASH), KS("_", KEY_MINUS), K("=", KEY_EQUAL),
 		KBACKSPACE };
 	static const struct osk_key bottom_letters[] = {
-		{ "&123", NULL, 0, false, ACT_PAGE, 1.4 },
-		{ NULL, "smiley", 0, false, ACT_EMOJI, 1 }, K(",", KEY_COMMA),
-		{ "space", NULL, KEY_SPACE, false, ACT_CHAR, 4.6 }, K(".", KEY_DOT),
-		{ NULL, "enter", KEY_ENTER, false, ACT_CHAR, 1.6 } };
-	static const struct osk_key bottom_symbols[] = {
-		{ "abc", NULL, 0, false, ACT_PAGE, 1.4 },
-		{ NULL, "smiley", 0, false, ACT_EMOJI, 1 }, K(",", KEY_COMMA),
-		{ "space", NULL, KEY_SPACE, false, ACT_CHAR, 4.6 }, K(".", KEY_DOT),
-		{ NULL, "enter", KEY_ENTER, false, ACT_CHAR, 1.6 } };
+        { "&123", NULL, 0, false, ACT_PAGE, 1 },
+        { NULL, "smiley", 0, false, ACT_EMOJI, 1 }, K(",", KEY_COMMA),
+        { "space", NULL, KEY_SPACE, false, ACT_CHAR, 4 }, K(".", KEY_DOT),
+        { NULL, "enter", KEY_ENTER, false, ACT_CHAR, 1 } };
+    static const struct osk_key bottom_symbols[] = {
+        { "abc", NULL, 0, false, ACT_PAGE, 1 },
+        { NULL, "smiley", 0, false, ACT_EMOJI, 1 }, K(",", KEY_COMMA),
+        { "space", NULL, KEY_SPACE, false, ACT_CHAR, 4 }, K(".", KEY_DOT),
+        { NULL, "enter", KEY_ENTER, false, ACT_CHAR, 1 } };
 	server->n_keys = 0;
 	double y = KEY_GAP;
 	if (server->osk_terminal) {
@@ -4115,12 +4177,12 @@ static void osk_layout(struct zt_server *server) {
         osk_row(server, s1, 10, y, server->key_height, 0);
 		osk_row(server, s2, 10, y + server->key_height, server->key_height, 0);
 		osk_row(server, s3, 10, y + 2 * server->key_height, server->key_height, 0);
-		osk_row(server, bottom_symbols, 6, y + 3 * server->key_height, server->key_height, 0);
+		osk_grid_row(server, bottom_symbols, 6, y + 3 * server->key_height);
 	} else {
 		osk_row(server, l1, 10, y, server->key_height, 0);
-		osk_row(server, l2, 9, y + server->key_height, server->key_height, server->width / 20.0);
-		osk_row(server, l3, 9, y + 2 * server->key_height, server->key_height, 0);
-		osk_row(server, bottom_letters, 6, y + 3 * server->key_height, server->key_height, 0);
+		osk_grid_row(server, l2, 9, y + server->key_height);
+		osk_grid_row(server, l3, 9, y + 2 * server->key_height);
+		osk_grid_row(server, bottom_letters, 6, y + 3 * server->key_height);
 	}
 	server->osk_h = y + 4 * server->key_height;
 }
@@ -4130,7 +4192,7 @@ static void osk_layout(struct zt_server *server) {
 static void draw_keypop(struct zt_server *server) {
 	bool was = server->keypop;
 	server->keypop = false;
-	if (server->osk_pressed >= 0 && server->osk_pressed < server->n_keys) {
+	if (!server->auth_active && server->osk_pressed >= 0 && server->osk_pressed < server->n_keys) {
 		struct osk_key *key = &server->keys[server->osk_pressed];
 		if (key->label && key->action == ACT_CHAR && strlen(key->label) == 1 &&
 				key->label[0] != ' ') {
@@ -4250,6 +4312,20 @@ static void draw_osk(struct zt_server *server) {
 		}
 	}
 
+    if (server->osk_trackpad) {
+        cairo_set_source_rgb(cr, 0.08, 0.08, 0.08);
+        cairo_paint(cr);
+        cairo_set_source_rgb(cr, 0.55, 0.55, 0.55);
+        draw_text(cr, "move cursor", FONT_REGULAR, 16, 0, 0,
+            server->width, server->osk_h, true);
+    }
+    /* The corner dot stays small; its invisible touch target is larger. */
+    cairo_set_source_rgb(cr, 0, 0, 0);
+    cairo_arc(cr, osk_dot_x(server), osk_dot_y(server), 10, 0, 2 * M_PI);
+    cairo_fill(cr);
+    set_rgb(cr, server->accent);
+    cairo_arc(cr, osk_dot_x(server), osk_dot_y(server), 3.5, 0, 2 * M_PI);
+    cairo_fill(cr);
 	zt_buffer_show(server, &server->osk_layer, buffer, cr, server->width, server->osk_h);
 	draw_keypop(server);
 }
@@ -4306,6 +4382,11 @@ static void osk_show(struct zt_server *server, bool visible) {
 		wlr_log(WLR_INFO, "keyboard %s%s", visible ? "shown" : "hidden",
 			visible && server->osk_terminal ? " (terminal row)" : "");
 	}
+    if (server->osk_cursor_touch) {
+        server->osk_cursor_touch->role = ROLE_NONE;
+        server->osk_cursor_touch = NULL;
+    }
+    server->osk_trackpad = false;
 	server->osk_visible = visible;
 	server->osk_pressed = -1;
 	if (visible) {
@@ -4462,10 +4543,15 @@ static void show_toplevel(struct zt_server *server, struct zt_toplevel *toplevel
 	}
 	wl_event_source_timer_update(server->launch_timer, 0);
 	server->shown = toplevel;
+	server->pending_command[0] = 0;
+	server->pending_pid = 0;
 	if (toplevel != previous) {
 		perf_focus(toplevel);
 	}
 	if (!toplevel) {
+        server->pending_command[0] = 0;
+        server->pending_pid = 0;
+        server->loading_since = 0;
 		wlr_log(WLR_INFO, "showing Start");
 		wlr_seat_keyboard_notify_clear_focus(server->seat);
 		text_inputs_focus(server, NULL);
@@ -4573,6 +4659,15 @@ static pid_t *started_pid(struct zt_server *server, const char *command) {
 /* Start `command`, or bring what it started before to the front. Whoever
  * calls says first which tile or row was tapped: that one leaves last. */
 static void launch(struct zt_server *server, const char *command) {
+    struct zt_toplevel *existing;
+    wl_list_for_each(existing, &server->toplevels, link) {
+        if (existing->mapped && existing->launch_command[0] &&
+                strcmp(existing->launch_command, command) == 0) {
+            server->launch_ms = now_ms();
+            show_toplevel(server, existing);
+            return;
+        }
+    }
 	/* An SDK app (~/.local/share/ztos/apps/ID) is forked from the warm
 	 * runtime, not from what we start: its window is not that pid's. It is
 	 * known by its app_id, "ztos.ID", instead. */
@@ -4601,9 +4696,15 @@ static void launch(struct zt_server *server, const char *command) {
 				return;
 			}
 		}
-		if (kill(*started, 0) == 0) {
-			return;	/* started, has not shown a window yet */
-		}
+        if (kill(*started, 0) == 0) {
+            server->launch_ms = server->loading_since = now_ms();
+            server->pending_pid = *started;
+            snprintf(server->pending_command, sizeof(server->pending_command), "%s", command);
+            prepare_loading(server);
+            start_turn(server, true, 0);
+            wl_event_source_timer_update(server->launch_timer, LAUNCH_WAIT_MS);
+            return; /* wait for the existing launch, without another process */
+        }
 	}
 	if (strncmp(command, "demo:", 5) == 0) {
 		/* nothing to start: Start leaves as it would, and comes back */
@@ -4611,6 +4712,7 @@ static void launch(struct zt_server *server, const char *command) {
 		wl_event_source_timer_update(server->launch_timer, server->slow_motion ? 3500 : 900);
 		return;
 	}
+	prepare_loading(server);
 	uint32_t launch_at = now_ms();
 	uint32_t enter_at = launch_at +
 		menu_ms(server, (uint32_t)start_out_ms(server) + TURN_GAP_MS) * (server->slow_motion ? 5 : 1);
@@ -4636,7 +4738,13 @@ static void launch(struct zt_server *server, const char *command) {
 		execl("/bin/sh", "/bin/sh", "-c", line, (void *)NULL);
 		_exit(127);
 	}
+    if (pid < 0) {
+        wlr_log(WLR_ERROR, "launch: fork failed: %s", strerror(errno));
+        return;
+    }
 	*started = pid;
+    server->pending_pid = pid;
+    snprintf(server->pending_command, sizeof(server->pending_command), "%s", command);
 	server->launch_ms = launch_at;
 	server->loading_since = server->launch_ms;
 	wlr_log(WLR_INFO, "launched '%s' as %d", command, pid);
@@ -4662,6 +4770,13 @@ static void launch_item(struct zt_server *server, int index) {
 /* The app never showed a window: bring Start back. */
 static int launch_timed_out(void *data) {
 	struct zt_server *server = data;
+    /* A live application may still be doing a slow first launch. */
+    if (server->pending_pid > 0 && kill(server->pending_pid, 0) == 0 && !server->shown) {
+        wl_event_source_timer_update(server->launch_timer, 1000);
+        return 0;
+    }
+    server->pending_command[0] = 0;
+    server->pending_pid = 0;
 	server->loading_since = 0;
 	if (!server->shown) {
 		wlr_log(WLR_INFO, "launch: no window, back to Start");
@@ -4818,14 +4933,7 @@ static void launch_cmd(struct zt_server *server, const char *cmd) {
 			return;
 		}
 	}
-	pid_t pid = fork();
-	if (pid == 0) {
-		setsid();
-		child_priority();
-		signal(SIGCHLD, SIG_DFL);
-		execl("/bin/sh", "/bin/sh", "-c", cmd, (void *)NULL);
-		_exit(127);
-	}
+	launch(server, cmd);
 }
 
 /* Start a helper and do not wait for it: nothing here may block a frame. */
@@ -5086,6 +5194,18 @@ static void osk_activate(struct zt_server *server, int index) {
 		osk_layout(server);
 		break;
 	case ACT_CHAR:
+        if (server->auth_active) {
+            const xkb_keysym_t *syms = NULL;
+            int level = key->shift || server->osk_shift ? 1 : 0;
+            int n = xkb_keymap_key_get_syms_by_level(server->vkbd.keymap, key->keycode+8, 0, level, &syms);
+            char text[64] = "";
+            if (n > 0) xkb_keysym_to_utf8(syms[0], text, sizeof(text));
+            auth_input(server, key->keycode, text);
+            if (server->osk_shift) server->osk_base_dirty = true;
+            server->osk_shift = server->osk_ctrl = server->osk_alt = false;
+            server->key_prefix[0] = 0;
+            break;
+        }
 		vkbd_send(server, key->keycode, key->shift || server->osk_shift);
 		size_t n = strlen(server->key_prefix);
         if (key->keycode == KEY_BACKSPACE) {
@@ -5107,6 +5227,13 @@ static void osk_activate(struct zt_server *server, int index) {
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	struct zt_toplevel *toplevel = wl_container_of(listener, toplevel, map);
 	toplevel->mapped = true;
+    struct zt_server *server = toplevel->server;
+    if (server->pending_command[0]) {
+        snprintf(toplevel->launch_command, sizeof(toplevel->launch_command), "%s",
+            server->pending_command);
+        server->pending_command[0] = 0;
+        server->pending_pid = 0;
+    }
 	show_toplevel(toplevel->server, toplevel);
 }
 
@@ -5819,6 +5946,17 @@ static int long_press_fired(void *data) {
 	uint32_t now = now_ms();
 	for (int i = 0; i < MAX_TOUCH; i++) {
 		struct touch_point *p = &server->touches[i];
+        if (p->used && p == server->osk_cursor_touch && p->role == ROLE_CURSOR &&
+                !p->long_pressed && !p->moved && server->osk_visible &&
+                now - p->down_ms >= LONG_PRESS_MS - 30) {
+            p->long_pressed = true;
+            p->lx = p->x; p->ly = p->y;
+            server->osk_trackpad = true;
+            server->osk_pressed = -1;
+            hap(server, HAP_TICK, HG_KEYS);
+            draw_osk(server);
+            continue;
+        }
 		if (p->used && p->role == ROLE_SHADE && !server->shade_open && !p->moved &&
 				!p->long_pressed && p->y0 <= STATUS_H + 12 && now - p->down_ms >= PEEK_HOLD_MS - 30) {
 			/* resting on the status bar: its second line comes down */
@@ -6020,6 +6158,8 @@ static void draw_dialog(struct zt_server *server) {
 	double text_y = title_y + title_h + 12.0;
 	double btn_h = 40.0;
 	double btn_y = text_y + th + 20.0;
+    double auth_y = btn_y;
+    if (server->auth_active) btn_y += 90;
 
 	bool stack_buttons = false;
 	if (server->dialog_btn2[0]) {
@@ -6105,11 +6245,25 @@ static void draw_dialog(struct zt_server *server) {
 		draw_text(cr, server->dialog_btn1, FONT_REGULAR, 15.0, pad, btn_y, content_w, btn_h, true);
 	}
 
+    if (server->auth_active) {
+        cairo_set_source_rgb(cr, .3, .3, .3);
+        cairo_rectangle(cr, pad, auth_y, content_w, 42); cairo_fill(cr);
+        char masked[100]; int count = 0;
+        for (size_t i = 0; i < server->auth_len && count < 96; i++)
+            if (((unsigned char)server->auth_password[i] & 0xc0) != 0x80) masked[count++] = '*';
+        masked[count] = 0;
+        cairo_set_source_rgb(cr, 1, 1, 1);
+        draw_text(cr, masked, FONT_REGULAR, 20, pad+12, auth_y, content_w-24, 42, false);
+        if (server->auth_success) cairo_set_source_rgb(cr, .4, 1, .5);
+        else if (!server->auth_busy && strncmp(server->auth_status, "Enter", 5)) cairo_set_source_rgb(cr, 1, .5, .5);
+        else cairo_set_source_rgb(cr, .8, .8, .8);
+        draw_text(cr, server->auth_status, FONT_REGULAR, 13, pad, auth_y+50, content_w, 24, false);
+    }
 	zt_buffer_show(server, &server->dialog_layer, buffer, cr, (int)w, (int)total_h);
 }
 
 static void dialog_close(struct zt_server *server) {
-	if (!server->dialog_open) return;
+	if (server->auth_active || !server->dialog_open) return;
 	animate(server, &server->dialog_y, (float)-server->dialog_h, 170, 0, false);
 	server->dialog_open = false;
 	damage(server);
@@ -6117,6 +6271,11 @@ static void dialog_close(struct zt_server *server) {
 
 static void dialog_handle_action(struct zt_server *server, const char *act) {
 	if (!act || !act[0]) return;
+    if (!strcmp(act, "auth_submit")) { auth_submit(server); return; }
+    if (!strcmp(act, "auth_cancel")) {
+        send(server->auth_fd, "CANCEL\n", 7, MSG_NOSIGNAL);
+        auth_finish(server); return;
+    }
 	wlr_log(WLR_INFO, "dialog: executing action '%s'", act);
 	if (strcmp(act, "reboot_recovery") == 0) {
 		pipe_tell("/run/ztoscsf.ctl", "reboot_recovery\n");
@@ -6137,6 +6296,7 @@ static void dialog_handle_action(struct zt_server *server, const char *act) {
 
 static void dialog_show(struct zt_server *server, const char *title, const char *text,
 		const char *btn1, const char *act1, const char *btn2, const char *act2) {
+    if (server->auth_active && (!act1 || strcmp(act1, "auth_submit"))) return;
 	snprintf(server->dialog_title, sizeof(server->dialog_title), "%s", title ? title : "Dialog");
 	snprintf(server->dialog_text, sizeof(server->dialog_text), "%s", text ? text : "");
 	snprintf(server->dialog_btn1, sizeof(server->dialog_btn1), "%s", btn1 ? btn1 : "ok");
@@ -6153,6 +6313,8 @@ static void dialog_show(struct zt_server *server, const char *title, const char 
 	hap(server, HAP_TAP, HG_SYSTEM);
 	damage(server);
 }
+
+#include "auth/prompt.c"
 
 /* Uninstall an SDK app from the app list: it is closed, its tile goes, and
  * its files (the binary, its entry, icon, saved data and log), all in the
@@ -6237,6 +6399,7 @@ static void screen_set(struct zt_server *server, bool on) {
 	if (!server->output || server->screen_on == on) {
 		return;
 	}
+	if (!on && server->auth_active) auth_finish(server);
 	if (on) {
 		perf_tell("screen on\n");	/* clocks back up before the first frame */
 	}
@@ -6342,7 +6505,9 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		p->role = ROLE_NONE;
 		return;
 	}
-	if (server->dialog_open && server->dialog_y > (float)-server->dialog_h + 10.0f) {
+    if (server->auth_active && y >= server->height-NAV_H) { p->role = ROLE_NONE; return; }
+	if (server->dialog_open && server->dialog_y > (float)-server->dialog_h + 10.0f &&
+            !(server->auth_active && server->osk_visible && y >= server->height-NAV_H-server->osk_h)) {
 		if (y >= server->dialog_y && y <= server->dialog_y + server->dialog_h) {
 			double dy = y - server->dialog_y;
 			double pad = 24.0, btn_gap = 12.0;
@@ -6492,6 +6657,24 @@ static void touch_begin(struct zt_server *server, int32_t id, double x, double y
 		return;
 	}
 	if (server->osk_visible && y >= server->height - NAV_H - server->osk_h) {
+        if (server->osk_cursor_touch) {
+            p->role = ROLE_NONE;
+            return;
+        }
+        double dot_y = server->height - NAV_H - server->osk_h + osk_dot_y(server);
+        if (!server->auth_active && hypot(x - osk_dot_x(server), y - dot_y) <= 14) {
+            /* Existing key contacts must not commit when trackpad mode starts. */
+            for (int i = 0; i < MAX_TOUCH; i++)
+                if (server->touches[i].used && server->touches[i].role == ROLE_KEY)
+                    server->touches[i].role = ROLE_NONE;
+            p->role = ROLE_CURSOR;
+            p->down_ms = now_ms();
+            server->osk_cursor_touch = p;
+            server->osk_pressed = -1;
+            draw_osk(server);
+            wl_event_source_timer_update(server->long_press_timer, LONG_PRESS_MS);
+            return;
+        }
 		p->role = ROLE_KEY;
 		p->index = key_at(server, x, y);
 		server->osk_pressed = p->index;
@@ -6732,6 +6915,23 @@ static void touch_update(struct zt_server *server, int32_t id, double x, double 
 			p->ox + (x - p->x0) / p->fit, p->oy + (y - p->y0) / p->fit);
 		wlr_seat_touch_notify_frame(server->seat);
 		break;
+    case ROLE_CURSOR:
+        if (server->osk_trackpad && server->osk_cursor_touch == p) {
+            /* Accumulate sub-cell movement, with no acceleration or sound. */
+            bool ctrl = server->osk_ctrl, alt = server->osk_alt;
+            server->osk_ctrl = server->osk_alt = false;
+            int dx = (int)((x - p->lx) / 10.0);
+            int dy = (int)((y - p->ly) / 18.0);
+            dx = dx < -32 ? -32 : dx > 32 ? 32 : dx;
+            dy = dy < -16 ? -16 : dy > 16 ? 16 : dy;
+            for (int i = 0; i < abs(dx); i++)
+                vkbd_send(server, dx < 0 ? KEY_LEFT : KEY_RIGHT, false);
+            for (int i = 0; i < abs(dy); i++)
+                vkbd_send(server, dy < 0 ? KEY_UP : KEY_DOWN, false);
+            p->lx += dx * 10.0; p->ly += dy * 18.0;
+            server->osk_ctrl = ctrl; server->osk_alt = alt;
+        }
+        break;
 	case ROLE_KEY: {
 		/* sliding to another key before lifting picks that key instead */
 		int index = key_at(server, x, y);
@@ -6986,6 +7186,15 @@ static void touch_end(struct zt_server *server, int32_t id, uint32_t time, bool 
 			}
 		}
 		break;
+    case ROLE_CURSOR:
+        if (server->osk_cursor_touch == p) {
+            server->osk_cursor_touch = NULL;
+            server->osk_trackpad = false;
+            server->osk_pressed = -1;
+            wl_event_source_timer_update(server->long_press_timer, 0);
+            if (server->osk_visible) draw_osk(server);
+        }
+        break;
 	case ROLE_KEY:
 		if (!cancelled && p->index >= 0) {
 			osk_activate(server, p->index);
@@ -7155,6 +7364,9 @@ static void ctl_command(struct zt_server *server, char *line) {
 				app_ready(server, t);
 			}
 		}
+	} else if (strcmp(line, "clock") == 0) {
+        clock_tick(server);
+        damage(server);
 	} else if (strncmp(line, "apps", 4) == 0) {
 		load_apps(server);	/* ztapps: an application came or went */
 	} else if (strncmp(line, "haptic ", 7) == 0) {
@@ -7369,6 +7581,14 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 		}
 		return;
 	}
+    if (server->auth_active) {
+        if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+            char text[64] = "";
+            xkb_state_key_get_utf8(keyboard->wlr_keyboard->xkb_state, event->keycode+8, text, sizeof(text));
+            auth_input(server, event->keycode, text);
+        }
+        return;
+    }
 	wlr_seat_set_keyboard(server->seat, keyboard->wlr_keyboard);
 	wlr_seat_keyboard_notify_key(server->seat, event->time_msec, event->keycode, event->state);
 }
@@ -7671,7 +7891,7 @@ static void render_frame(struct zt_server *server) {
 	bool running = anims_step(server, now);
 	server->moving = physics_step(server, now);
 	/* (before the frame's own drawing: it makes textures of its own) */
-	bool preparing = list_prepare(server);
+	bool preparing = !server->splash && !server->loading_since && list_prepare(server);
 	if (status_moving(server)) {
 		/* an icon in the status row on its way in or out: the row is small */
 		draw_status(server);
@@ -7722,6 +7942,12 @@ static void render_frame(struct zt_server *server) {
 	glClearColor(0, 0, 0, 1);
 	glClear(GL_COLOR_BUFFER_BIT);
 
+	struct zt_toplevel *app = server->shown ? server->shown : server->leaving;
+	struct app_draw draw = { .server = server, .x = 0, .y = STATUS_H - server->app_lift, .scale = 1.0f,
+		.angle = server->app_angle,
+		.alpha = fminf(1.0f, server->app_alpha * 4.0f) * turn_alpha(fabsf(server->app_angle) / TURN_OUT_DEG) };
+	/* The opaque boot splash covers these layers; avoid drawing them underneath. */
+	if (!server->splash) {
 	/* Start and the app list beside it, unless they have swung away completely */
 	if (server->start_t < 0.999f) {
 		float page_dx = -server->page * (float)server->width;
@@ -7878,10 +8104,7 @@ static void render_frame(struct zt_server *server) {
 	}
 
 	/* the app in front, or the one swinging out */
-	struct zt_toplevel *app = server->shown ? server->shown : server->leaving;
-	struct app_draw draw = { .server = server, .x = 0, .y = STATUS_H - server->app_lift, .scale = 1.0f,
-		.angle = server->app_angle,
-		.alpha = fminf(1.0f, server->app_alpha * 4.0f) * turn_alpha(fabsf(server->app_angle) / TURN_OUT_DEG) };
+
 	if (server->switch_t > 0.001f && server->n_cards > 0) {
 		/* the switcher: black over whatever was there, and the apps as cards */
 		float t = server->switch_t, m[16];
@@ -7985,6 +8208,7 @@ static void render_frame(struct zt_server *server) {
 		layer_draw(server, &server->shade_layer, 0, reveal - (float)SHADE_MAX_H, 1.0f);
 		glDisable(GL_SCISSOR_TEST);
 	}
+	} /* layers hidden by the boot splash */
 	if (server->splash && server->splash_layer.tex) {
 		layer_draw(server, &server->splash_layer, 0, 0, 1.0f);
 	}
@@ -8125,6 +8349,7 @@ static void render_frame(struct zt_server *server) {
 	wlr_output_state_finish(&state);
 	server->dirty = false;
 	clock_gettime(CLOCK_MONOTONIC, &t3);
+	running = running || loading_active(server);
 	if (running) {
 		server->anim_draw_ms += (t1.tv_sec * 1e3 + t1.tv_nsec / 1e6) - now;
 		server->anim_finish_ms += (t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
@@ -8179,7 +8404,7 @@ static void output_frame(struct wl_listener *listener, void *data) {
 	struct zt_output *output = wl_container_of(listener, output, frame);
 	struct zt_server *server = output->server;
 	/* nothing damaged and nothing moving: no frame, and no further wake-ups */
-	if (server->dirty || server->moving || animating(server, NULL)) {
+	if (server->dirty || server->moving || loading_active(server) || animating(server, NULL)) {
 		render_frame(server);
 	}
 }
@@ -8427,10 +8652,28 @@ static int render_to_files(struct zt_server *server, const char *dir) {
 	g_dump_name = "shade";
 	server->shade_wifi = wifi_up();
 	draw_shade(server);
+    g_dump_name = "authentication";
+    server->auth_active = true;
+    snprintf(server->auth_status, sizeof(server->auth_status), "Enter your password");
+    dialog_show(server, "Authentication required", "Authenticate to change system settings",
+        "authenticate", "auth_submit", "cancel", "auth_cancel");
+    g_dump_name = "authentication-retry";
+    snprintf(server->auth_status, sizeof(server->auth_status), "Incorrect password. Try again.");
+    draw_dialog(server);
+    server->auth_active = false;
+    server->dialog_open = false;
 	g_dump_name = "keyboard";
-	server->osk_terminal = true;
+	server->osk_terminal = false;
 	osk_layout(server);
 	draw_osk(server);
+    g_dump_name = "keyboard-trackpad";
+    server->osk_trackpad = true;
+    draw_osk(server);
+    server->osk_trackpad = false;
+    g_dump_name = "keyboard-terminal";
+    server->osk_terminal = true;
+    osk_layout(server);
+    draw_osk(server);
 	for (int i = 0; i < server->n_tiles; i++) {
 		char name[32];
 		snprintf(name, sizeof(name), "tile-%d", i);
@@ -8456,6 +8699,7 @@ int main(int argc, char *argv[]) {
 	server.nav_pressed = -1;
 	server.osk_pressed = -1;
 	server.ctl_fd = -1;
+    server.auth_fd = -1;
 	server.tapped = -1;
 	server.tapped_item = -1;
 	server.edit = -1;
@@ -8630,7 +8874,10 @@ int main(int argc, char *argv[]) {
 		setenv("LANG", "C.UTF-8", true);
 	}
 
+    setenv("SUDO_ASKPASS", "/usr/local/bin/ztos-askpass", 1);
 	ctl_init(&server);
+    auth_init(&server);
+    run_detached("ztos-polkit-agent", NULL, NULL, NULL);
 	run_detached("/usr/local/bin/ztos-sounds", NULL, NULL, NULL);
 	{
 		char percent[16];

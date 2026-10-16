@@ -151,7 +151,7 @@ static void stream_state(pa_stream *s,void *data) {
 static void create_stream(void) {
  if(stream)return;
  pa_sample_spec spec={PA_SAMPLE_S16LE,RATE,2};
- pa_buffer_attr attr={.maxlength=4096*4,.tlength=2048*4,.prebuf=0,.minreq=512*4,.fragsize=(uint32_t)-1};
+ pa_buffer_attr attr={.maxlength=2048*4,.tlength=512*4,.prebuf=0,.minreq=128*4,.fragsize=(uint32_t)-1};
  pa_proplist *props=pa_proplist_new();
  pa_proplist_sets(props,PA_PROP_MEDIA_ROLE,"event");
  pa_proplist_sets(props,PA_PROP_APPLICATION_ID,"os.ztos.sounds");
@@ -239,6 +239,9 @@ static void tap(pa_mainloop_api *a,pa_io_event *event,int socket_fd,pa_io_event_
  struct timeval due=after_ms(IDLE_MS);
  if(idle_event)api->time_restart(idle_event,&due);else idle_event=api->time_new(api,&due,idle,NULL);
  if(corked) {
+  // Clear silence left from the previous idle period before waking.
+  pa_operation *flush=pa_stream_flush(stream,NULL,NULL);
+  if(flush)pa_operation_unref(flush);
   corked=false;pa_operation *op=pa_stream_cork(stream,0,NULL,NULL);
   if(op)pa_operation_unref(op);
  }

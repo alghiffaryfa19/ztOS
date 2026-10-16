@@ -6,13 +6,13 @@ XDG := $(WP)/stable/xdg-shell/xdg-shell.xml
 CFLAGS ?= -O2 -g
 WARN = -std=c11 -Wall -Wno-unused-parameter
 
-all: sounds/ztos-sounds ztmetro apps/ztapps settings/ztsettings devtest/zrndevtest perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd \
+all: auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps settings/ztsettings devtest/zrndevtest perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd \
 	csf/ztoscsf notifyd/ztnotifyd phone/ztphone messages/ztmessages contacts/ztcontacts
 
 sounds/ztos-sounds: sounds/ztos-sounds.c
 	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags libpulse) -o $@ $< $(shell pkg-config --libs libpulse) -lm
 
-ztmetro: ztmetro.c xdg-shell-protocol.h
+ztmetro: ztmetro.c auth/prompt.c xdg-shell-protocol.h
 	$(CC) $(CFLAGS) $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
 		-o $@ ztmetro.c $(shell pkg-config --libs $(PKGS)) -lm
 
@@ -85,6 +85,7 @@ core/viewporter-protocol.c:
 	wayland-scanner private-code $(VIEWPORTER) $@
 
 install: all
+	install -Dm755 auth/ztos-polkit-agent /usr/local/bin/ztos-polkit-agent
 	install -Dm755 sounds/ztos-sounds /usr/local/bin/ztos-sounds
 	install -Dm755 ztmetro /usr/local/bin/ztmetro
 	install -Dm755 ztmetro-session /usr/local/bin/ztmetro-session
@@ -110,5 +111,28 @@ install: all
 	install -Dm644 csf/ztoscoresensorframework.service /etc/systemd/system/ztoscoresensorframework.service
 
 clean:
-	rm -f sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf \
+	rm -f auth/ztos-polkit-agent sounds/ztos-sounds ztmetro apps/ztapps xdg-shell-protocol.h settings/ztsettings devtest/zrndevtest perfd/zrnperfd sensord/ztoscsf-sensord modemd/ztoscorenetworkingd csf/ztoscsf \
 		core/xdg-shell-client-protocol.h core/xdg-shell-protocol.c
+
+# Uses a private Wayland seat; does not touch the running compositor or display.
+.PHONY: check-keyboard
+check-keyboard: xdg-shell-protocol.h
+	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
+		-o /tmp/ztmetro-keyboard-test tests/keyboard-trackpad.c $(shell pkg-config --libs $(PKGS)) -lm
+	/tmp/ztmetro-keyboard-test
+
+.PHONY: check-launch
+check-launch: xdg-shell-protocol.h
+	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
+		-o /tmp/ztmetro-launch-test tests/launch-state.c $(shell pkg-config --libs $(PKGS)) -lm
+	/tmp/ztmetro-launch-test
+
+.PHONY: check-auth
+check-auth: xdg-shell-protocol.h
+	$(CC) -O0 -g $(WARN) -DWLR_USE_UNSTABLE -I. $(shell pkg-config --cflags $(PKGS)) \
+		-o /tmp/ztmetro-auth-test tests/auth-prompt.c $(shell pkg-config --libs $(PKGS)) -lm
+	/tmp/ztmetro-auth-test
+
+# The native agent uses polkit's async callback API directly.
+auth/ztos-polkit-agent: auth/ztos-polkit-agent.c
+	$(CC) $(CFLAGS) $(WARN) $(shell pkg-config --cflags polkit-agent-1 gio-unix-2.0) -o $@ $< $(shell pkg-config --libs polkit-agent-1 gio-unix-2.0)

@@ -139,6 +139,29 @@ bound, clipping, and silent tails.
 The changes are installed on the test phone and included in fresh phone images.
 The ABOX kernel module and hardware clock registers were not changed.
 
+## Responsive keyboard taps
+
+The S9 IRQ path also passes at 512-frame hardware periods. The phone now uses
+512-frame periods, eight periods of ring capacity, and 256 frames of headroom;
+the graph minimum is 512 while the default/maximum remain 2048 for other
+outputs. On ABOX the observed IRQ-driven graph stays at 512 frames (10.7 ms),
+including with clients requesting larger blocks.
+
+The tap stream requests a 512-frame target and 128-frame minimum write; the
+Pulse server negotiates 256-frame writes and a 768-frame (16 ms) tap buffer.
+A flush before uncorking removes silence queued before idle. Full writes,
+four bounded voices, overlap balancing, and the idle cork are retained.
+
+Validation on the phone: 600 tap requests at 100/second over playback, then
+separated tap bursts over mpv/Cava with seeking and pause/resume. Speaker and
+tap stream error counts stayed zero, only one keyboard stream existed, and
+ALSA closed afterward. The original WAVs have less than 0.1 ms of leading
+silence above 5% of peak. These are negotiated buffering and graph timings,
+not a physical speaker latency measurement. Evidence:
+`build/power-analysis/typing-responsive-report.json`,
+`build/power-analysis/typing-responsive-top.log`, and
+`build/power-analysis/typing-transitions-top.log`.
+
 ## Not done
 
 - **Speaker protection.** On the stock system the DSP runs Maxim's DSM
