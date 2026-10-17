@@ -4,8 +4,8 @@
 
 ztOS is a phone operating system: the **ztMETRO** shell (Windows Phone 8.1's
 look and motion) on Arch Linux ARM and mainline Linux, with its own apps, an
-updater and an SDK for apps in Python and Qt. It runs on the Samsung Galaxy
-S9 (starlte) and in the QEMU emulator.
+updater and an SDK for apps in Python and Qt. The ztMETRO Shell and its components as written in C, and accelerated with OpenGL. Currently its ported for a Samsung Galaxy
+S9 (starlte), and I am hoping to expand supports for more devices in the future :).
 
 > This ROM is in very much Alpha, The installer is not tested on real hardware, open a issue in this github repo if you have any issues with it
 
